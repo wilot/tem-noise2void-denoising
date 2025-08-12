@@ -1,0 +1,15 @@
+name: Noise2Void
+channels:
+  - defaults
+dependencies:
+  - torchvision
+  - hyperspy
+  - tensorboard
+  - hydra-core
+  - tqdm
+  - matplotlib
+  - scipy
+  - numba
+  - numpy
+  - pytorch
+prefix: /opt/miniconda3/envs/Noise2Void

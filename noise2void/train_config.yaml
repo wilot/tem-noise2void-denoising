@@ -1,0 +1,21 @@
+# Noise2Void training run parameters
+
+run_directory: "runs/{SAMPLE_NAME}/runNNN"  # NNN is replaced with the next integer if necessary
+
+model:
+  name: "UNet"
+  channels: 2
+  depth: 4
+  first_layer_channels: 64
+  initial_kernel_size: 5
+
+trainer:
+  learning_rate: 1e-5
+  batch_size: 24
+  epochs: 10
+  spacing: 24
+  test_fraction: 0.2
+
+dataset:
+  image_size: 256
+  type: "WS2"
