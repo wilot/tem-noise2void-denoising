@@ -12,4 +12,5 @@ dependencies:
   - numba
   - numpy
   - pytorch
+  - matplotlib-scalebar
 prefix: /opt/miniconda3/envs/Noise2Void
