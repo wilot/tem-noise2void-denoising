@@ -1,6 +1,9 @@
 """tungsten_dataset.py
 
 Contains the PyTorch Dataset for the Tunsten Disulphide experimental data.
+
+Note: to delete all generated PNGs, navigate to the Tungsten WS2 data directory and use this command
+`find . -type f -regex ".*\.png" -not -name "1777865_LAADF_fft.png" -delete`
 """
 
 import re
@@ -29,12 +32,12 @@ class TungstenDataset:
     def __init__(self, image_size: int, channels: list[Channel]):
         self.channels = channels
         self.image_size = image_size
-        self.sample_filegroups, self.total_images = self._find_filepaths()
+        self.sample_filegroups = self._find_filepaths()
 
     def plot_images(self):
         """Converts each multi-channel image to a PNG"""
 
-        with tqdm(total=self.total_images, desc="Plotting multi-channel images") as pbar:
+        with tqdm(total=193, desc="Plotting multi-channel images") as pbar:
 
             for sample in self.sample_filegroups:
                 for im_index in self.sample_filegroups[sample]:
@@ -47,8 +50,10 @@ class TungstenDataset:
 
                     chans = sorted(self.sample_filegroups[sample][im_index].keys(), key=lambda chan: chan.value)
                     assert len(chans) > 0
-                    gridspec_kw = dict(left=0, right=1, bottom=0, top=1, hspace=0, wspace=0)
-                    fig, axes = plt.subplots(1, len(chans), figsize=(len(chans) * 8, 8))
+                    gridspec_kw = dict(left=0, right=1, bottom=0, top=0.91, hspace=0, wspace=0)
+                    fig, axes = plt.subplots(
+                        1, len(chans), figsize=(len(chans) * 8, 8 * 1.1), gridspec_kw=gridspec_kw
+                    )
                     for ax_index, chan in enumerate(chans):
                         sig = hs.load(self.sample_filegroups[sample][im_index][chan])
                         axes[ax_index].imshow(sig.data, cmap="inferno", interpolation=None)
@@ -128,15 +133,13 @@ class TungstenDataset:
         return True
 
     @classmethod
-    def _find_filepaths(cls) -> tuple[dict[str, dict[int, dict[Channel, Path]]], int]:
+    def _find_filepaths(cls) -> dict[str, dict[int, dict[Channel, Path]]]:
         """Constructs the dictionary of filepaths in the experimental dataset
 
         Returns
         -------
         dict[str, dict[int, dict[Channel, Path]]]
             Dictionary of filepaths of the form `dict[sample-name][image-index][channel]`
-        int
-            The total number of multi-channel images found
         """
 
         sample_filedirs = {  # Different glob and pairing for each, yay!
@@ -146,7 +149,6 @@ class TungstenDataset:
             "Jul24_tWS2_1": cls.DATA_DIRECTORY / "Jul24" / "ws2_1",
             "Jul24_tWS2_3": cls.DATA_DIRECTORY / "Jul24" / "ws2_3",
         }
-        total_images = 0
 
         # Using same str-keys, link files with the same ID as channels
         sample_filegroups: dict[str, dict[int, dict[Channel, Path]]] = dict()
@@ -163,7 +165,6 @@ class TungstenDataset:
                 index = int(index)
                 if not cls._try_insert(sample_filegroups, sample, chan, index, fpath):
                     continue
-                total_images += 1
 
         sample_filegroups["May25_tWS2_4"] = dict()
         for fpath in sample_filedirs["May25_tWS2_4"].glob("*.dm4"):
@@ -178,7 +179,6 @@ class TungstenDataset:
                 continue  # Too low mag to be useful
             if not cls._try_insert(sample_filegroups, "May25_tWS2_4", chan, index, fpath):
                 continue
-            total_images += 1
 
         for sample in ("Jul24_tWS2_1", "Jul24_tWS2_3"):  # These two are organised the same
             sample_filegroups[sample] = dict()
@@ -196,9 +196,8 @@ class TungstenDataset:
                     continue
                 if not cls._try_insert(sample_filegroups, sample, chan, index, fpath):
                     continue
-                total_images += 1
 
-        return sample_filegroups, total_images
+        return sample_filegroups
 
 
 if __name__ == "__main__":
