@@ -51,26 +51,27 @@ class TungstenDataset:
         self.px_scale = px_scale
         print("Finding filepaths")
         self._all_sample_filegroups = self._find_filepaths()
+        print("Fetching scales and shapes")
+        for meta in self._all_sample_filegroups:
+            meta.fetch_scale_shape()
 
         with open(self.BLACKLIST_FILE, 'rb') as file:
             blacklist = tomllib.load(file)
+        assert set(blacklist.keys()) == set(meta.sample for meta in self._all_sample_filegroups)
         self.samples = set(blacklist.keys())
 
         print("Applying blacklist")
-        self._valid_sample_filegroups = list(filter(
+        self._valid_sample_filegroups = list(filter(  # TODO: Bug, this is filtering out everything!
             lambda meta: meta.is_blacklisted(blacklist),
             self._all_sample_filegroups
         ))
+        print(f"Post blacklist length: {len(self._valid_sample_filegroups)}")
 
         print("Filtering by channels")
         self._channel_sample_filegroups = list(filter(
             lambda meta: meta.has_channels(channels),
             self._valid_sample_filegroups
         ))
-
-        print("Fetching scales and shapes")
-        for meta in self._channel_sample_filegroups:
-            meta.fetch_scale_shape()
 
         print("Filtering by scale")
         self._to_scale_sample_filegroups = list(filter(
@@ -138,7 +139,6 @@ class TungstenDataset:
             print(f"{sample:-^16}")
             image_shapes: list[int] = list()
             for meta in filter(lambda meta: meta.sample == sample, self._all_sample_filegroups):
-                an_fpath = meta.an_fpath()
                 im_shape = meta.shape
                 image_shapes.append(im_shape)
             im_sizes, size_frequencies = np.unique(image_shapes, return_counts=True)
@@ -266,5 +266,5 @@ class TungstenDataset:
 if __name__ == "__main__":
     # For getting info on the samples and plotting etc.
 
-    dset = TungstenDataset(256, [Channel.HAADF, Channel.BF], 0.007)
+    dset = TungstenDataset(256, [Channel.HAADF, Channel.BF, Channel.LAADF], 0.007)
     dset.print_dataset_stats()

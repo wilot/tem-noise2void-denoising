@@ -36,10 +36,10 @@ class MultiChannelMetadata:
         if px_units == "Å":  # Everything in nanometres
             px_scale /= 10.
             px_units = "nm"
-        elif px_units == "um":
+        elif px_units == "µm":
             px_scale *= float(1E3)
             px_units = "nm"
-        assert px_units == "nm"
+        assert px_units == "nm", f"Unexpected units: {px_units}"
         assert sig.data.shape[-2] == sig.data.shape[-1]
         self.px_scale = px_scale
         self.shape = sig.data.shape[-1]
