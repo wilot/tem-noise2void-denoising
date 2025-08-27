@@ -6,6 +6,8 @@ A type for HAADF, LAADF and BF channels in STEM.
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
+
 import hyperspy.api as hs
 
 
@@ -23,11 +25,11 @@ class MultiChannelMetadata:
         self, fpaths: dict[Channel, Path], sample: str, index: int,
     ):
         assert len(fpaths) > 0
-        self.fpaths = fpaths
+        self.fpaths: dict[Channel, Path] = fpaths
         self.sample = sample
         self.index = index
-        self.px_scale = None
-        self.shape = None
+        self.px_scale: float | None = None
+        self.shape: int | None = None
 
     def fetch_scale_shape(self):
         an_fpath = self.an_fpath()
@@ -63,3 +65,14 @@ class MultiChannelMetadata:
 
     def an_fpath(self) -> Path:
         return next(iter(self.fpaths.values()))
+
+    def load_channels(self, channels: list[Channel]) -> np.ndarray:
+        """Loads the specified channels into an[C, Y, X] array where C are the channels specified, in the order
+        provided. Raises an error if the channel is not found. The datatype is not modified"""
+
+        if not all(chan in self.fpaths for chan in channels):
+            raise ValueError(f"The channels {channels} are not all found for this image:\n\t{self.fpaths}")
+        return np.stack(
+            [hs.load(self.fpaths[chan]).data for chan in channels],
+            axis=0
+        )

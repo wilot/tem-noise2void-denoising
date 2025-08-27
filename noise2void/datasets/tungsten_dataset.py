@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
-import torchvision.transforms.v2
+import torchvision.transforms.v2 as tforms
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -28,7 +28,7 @@ from tqdm import tqdm
 from channels import Channel, MultiChannelMetadata
 
 
-class TungstenDataset:
+class TungstenDataset(Dataset):
     """Abstraction over the twisted WS2 dataset"""
 
     DATA_DIRECTORY = Path("data/Twisted WS2/raw_images")
@@ -46,6 +46,7 @@ class TungstenDataset:
             The pixel size, in nanometres. Images with similar `px_scale` will be interpolated to match this value
         """
         print("Initialising Dataset")
+        assert len(set(channels)) == len(channels)
         self.channels = channels
         self.image_size = image_size
         self.px_scale = px_scale
@@ -61,15 +62,15 @@ class TungstenDataset:
         self.samples = set(blacklist.keys())
 
         print("Applying blacklist")
-        self._valid_sample_filegroups = list(filter(  # TODO: Bug, this is filtering out everything!
-            lambda meta: meta.is_blacklisted(blacklist),
+        self._valid_sample_filegroups = list(filter(
+            lambda meta: not meta.is_blacklisted(blacklist),
             self._all_sample_filegroups
         ))
         print(f"Post blacklist length: {len(self._valid_sample_filegroups)}")
 
         print("Filtering by channels")
         self._channel_sample_filegroups = list(filter(
-            lambda meta: meta.has_channels(channels),
+            lambda meta: meta.has_channels(set(channels)),
             self._valid_sample_filegroups
         ))
 
@@ -79,89 +80,42 @@ class TungstenDataset:
             self._channel_sample_filegroups
         ))
 
+        self._transform = tforms.Compose([
+            tforms.RandomCrop(self.image_size),
+            # tforms.RandomHorizontalFlip(),
+            # tforms.RandomVerticalFlip(),
+        ])
+
         self.sample_filegroups = self._to_scale_sample_filegroups
 
-    def _plot_images(self):
-        """Converts each multi-channel image to a PNG"""
+    def load_interpolate_crop(self, meta: MultiChannelMetadata) -> torch.Tensor:
+        """Loads, interpolates and crops the multi-channel image specified by the index"""
 
-        with tqdm(total=193, desc="Plotting multi-channel images") as pbar:
+        datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
+        interp_factor = meta.px_scale / self.px_scale
+        datum = tforms.functional.resize(datum, int(interp_factor * meta.shape))  # Interpolate to correct scale
+        datum = self._transform(datum)  # Randomly crop
+        return datum
 
-            for meta in self._all_sample_filegroups:
-                a_chan = next(iter(meta.fpaths.keys()))
-                savepath = meta.fpaths[a_chan].parent / \
-                    (meta.fpaths[a_chan].stem.strip(a_chan.value + "_") + ".png")
-                if savepath.exists():
-                    continue
+    @staticmethod
+    def normalise(datum: torch.Tensor) -> torch.Tensor:
+        """Normalises the image between zero and one"""
 
-                chans = sorted(meta.fpaths.keys(), key=lambda chan: chan.value)
-                assert len(chans) > 0
-                gridspec_kw = dict(left=0, right=1, bottom=0, top=0.91, hspace=0, wspace=0)
-                fig, axes = plt.subplots(
-                    1, len(chans), figsize=(len(chans) * 8, 8 * 1.1), gridspec_kw=gridspec_kw
-                )
-                for ax_index, chan in enumerate(chans):
-                    sig = hs.load(str(meta.fpaths[chan]))
-                    axes[ax_index].imshow(sig.data, cmap="inferno", interpolation=None)
-                    axes[ax_index].set_title(chan.value)
-                    axes[ax_index].axis("off")
-                sbar = ScaleBar(
-                    meta.px_scale, "nm", location="lower right", color='w', box_color='k', box_alpha=0.7
-                )
-                axes[ax_index].add_artist(sbar)
-                fig.savefig(savepath, dpi=210)
-                plt.close(fig)
-                pbar.update()
+        datum -= torch.amin(datum, dim=(-2, -1), keepdim=True)
+        datum /= torch.amax(datum, dim=(-2, -1), keepdim=True)
+        return datum
 
-    def print_dataset_stats(self):
-        """Prints sample-wise details about the samples' images, including image sizes and channels used."""
+    def __len__(self) -> int:
+        """The number of images in the dataset. Note random crops are applied, so the effective number is larger."""
 
-        # Count channels and ensure consistency
-        print("\n\n#       Channels       #")
-        for sample in self.samples:
-            print(f"{sample:-^16}")
-            sample_channels: set[Channel] | None = None
-            for meta in filter(lambda meta: meta.sample == sample, self._all_sample_filegroups):
-                chans = set(meta.fpaths.keys())
-                if  sample_channels is None:
-                    sample_channels = set(chans)
-                else:
-                    an_fpath = meta.an_fpath()
-                    if len(sample_channels) > len(chans):
-                        missing_channels = sample_channels - chans
-                        print(f"Warning: channel count mismatch for {an_fpath.name}, missing {missing_channels}")
-                    elif len(sample_channels) < len(chans):
-                        extra_channels = chans - sample_channels
-                        print(f"Warning: channel count mismatch for {an_fpath.name}, extra {extra_channels}")
-            print(f"Sample channels: {sample_channels}")
+        return len(self.sample_filegroups)
 
-        print("\n\n#       Image shapes       #")
-        for sample in self.samples:
-            print(f"{sample:-^16}")
-            image_shapes: list[int] = list()
-            for meta in filter(lambda meta: meta.sample == sample, self._all_sample_filegroups):
-                im_shape = meta.shape
-                image_shapes.append(im_shape)
-            im_sizes, size_frequencies = np.unique(image_shapes, return_counts=True)
-            print(f"Found image sizes: {im_sizes}")
-            print(f"Frequencies: {size_frequencies}")
+    def __getitem__(self, index: int) -> torch.Tensor:
+        """Loads, interpolates and randomly crops from the specified multi-channel image"""
 
-        print("\n\n    Dataset sizes    ")
-        print(f"Valid images: {len(self._valid_sample_filegroups)}")
-        print(f"Images satisfying channels {self.channels}: {len(self._channel_sample_filegroups)}")
-        print(f"Images satisfying mag constraints: {len(self._to_scale_sample_filegroups)}")
-        print(f"Total images used: {len(self.sample_filegroups)}")
-        print(f"Effective number of {self.image_size}px images in dataset (after mag interpolation): {self._calculate_effective_length()}")
-
-    def _calculate_effective_length(self) -> float:
-        """Calculates the effective length of the dataset, taking into account interpolation and tiled cropping"""
-
-        total = 0.0
-        for meta in self.sample_filegroups:
-            interp_factor = meta.scale / self.px_scale
-            new_shape = interp_factor * meta.shape
-            effective_images = (new_shape / self.image_size) ** 2.
-            total += effective_images
-        return total
+        datum = self.load_interpolate_crop(self.sample_filegroups[index])
+        datum = self.normalise(datum)
+        return datum
 
     @classmethod
     def _find_filepaths(cls) -> list[MultiChannelMetadata]:
@@ -243,6 +197,88 @@ class TungstenDataset:
 
         return sample_filegroups_list
 
+    def print_dataset_stats(self):
+        """Prints sample-wise details about the samples' images, including image sizes and channels used."""
+
+        # Count channels and ensure consistency
+        print("\n\n#       Channels       #")
+        for sample in self.samples:
+            print(f"{sample:-^16}")
+            sample_channels: set[Channel] | None = None
+            for meta in filter(lambda meta: meta.sample == sample, self._all_sample_filegroups):
+                chans = set(meta.fpaths.keys())
+                if  sample_channels is None:
+                    sample_channels = set(chans)
+                else:
+                    an_fpath = meta.an_fpath()
+                    if len(sample_channels) > len(chans):
+                        missing_channels = sample_channels - chans
+                        print(f"Warning: channel count mismatch for {an_fpath.name}, missing {missing_channels}")
+                    elif len(sample_channels) < len(chans):
+                        extra_channels = chans - sample_channels
+                        print(f"Warning: channel count mismatch for {an_fpath.name}, extra {extra_channels}")
+            print(f"Sample channels: {sample_channels}")
+
+        print("\n\n#       Image shapes       #")
+        for sample in self.samples:
+            print(f"{sample:-^16}")
+            image_shapes: list[int] = list()
+            for meta in filter(lambda meta: meta.sample == sample, self._all_sample_filegroups):
+                im_shape = meta.shape
+                image_shapes.append(im_shape)
+            im_sizes, size_frequencies = np.unique(image_shapes, return_counts=True)
+            print(f"Found image sizes: {im_sizes}")
+            print(f"Frequencies: {size_frequencies}")
+
+        print("\n\n    Dataset sizes    ")
+        print(f"Valid images: {len(self._valid_sample_filegroups)}")
+        print(f"Images satisfying channels {self.channels}: {len(self._channel_sample_filegroups)}")
+        print(f"Images satisfying mag constraints: {len(self._to_scale_sample_filegroups)}")
+        print(f"Total images used: {len(self.sample_filegroups)}")
+        print(f"Effective number of {self.image_size}px images in dataset (after mag interpolation): {self.calculate_effective_length():.1E}")
+
+    def _plot_images(self):
+        """Converts each multi-channel image to a PNG"""
+
+        with tqdm(total=193, desc="Plotting multi-channel images") as pbar:
+
+            for meta in self._all_sample_filegroups:
+                a_chan = next(iter(meta.fpaths.keys()))
+                savepath = meta.fpaths[a_chan].parent / \
+                    (meta.fpaths[a_chan].stem.strip(a_chan.value + "_") + ".png")
+                if savepath.exists():
+                    continue
+
+                chans = sorted(meta.fpaths.keys(), key=lambda chan: chan.value)
+                assert len(chans) > 0
+                gridspec_kw = dict(left=0, right=1, bottom=0, top=0.91, hspace=0, wspace=0)
+                fig, axes = plt.subplots(
+                    1, len(chans), figsize=(len(chans) * 8, 8 * 1.1), gridspec_kw=gridspec_kw
+                )
+                for ax_index, chan in enumerate(chans):
+                    sig = hs.load(str(meta.fpaths[chan]))
+                    axes[ax_index].imshow(sig.data, cmap="inferno", interpolation=None)
+                    axes[ax_index].set_title(chan.value)
+                    axes[ax_index].axis("off")
+                sbar = ScaleBar(
+                    meta.px_scale, "nm", location="lower right", color='w', box_color='k', box_alpha=0.7
+                )
+                axes[ax_index].add_artist(sbar)
+                fig.savefig(savepath, dpi=210)
+                plt.close(fig)
+                pbar.update()
+
+    def calculate_effective_length(self) -> float:
+        """Calculates the effective length of the dataset, taking into account interpolation and tiled cropping"""
+
+        total = 0.0
+        for meta in self.sample_filegroups:
+            interp_factor = meta.px_scale / self.px_scale
+            new_shape = interp_factor * meta.shape
+            effective_images = (new_shape / self.image_size) ** 2.
+            total += effective_images
+        return total
+
     @staticmethod
     def _try_insert_filepath(
         sample_filegroups: dict[str, dict[int, dict[Channel, Path]]], sample: str, chan: Channel, index: int,
@@ -266,5 +302,13 @@ class TungstenDataset:
 if __name__ == "__main__":
     # For getting info on the samples and plotting etc.
 
-    dset = TungstenDataset(256, [Channel.HAADF, Channel.BF, Channel.LAADF], 0.007)
+    dset = TungstenDataset(512, [Channel.HAADF, Channel.BF], 0.007)
     dset.print_dataset_stats()
+
+    fig, axes = plt.subplots(len(dset.channels), 4, sharex=True, sharey=True)
+    for col in axes.T:
+        index = torch.randint(0, len(dset), (1,))[0]
+        datum = dset[index]
+        for chan_index in range(len(dset.channels)):
+            col[chan_index].imshow(datum[chan_index], cmap="inferno", interpolation=None)
+    plt.show(block=True)
