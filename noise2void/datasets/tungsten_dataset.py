@@ -7,12 +7,11 @@ BF channels, and sometimes LAADF too. Some images are of very low magnification,
 are at high magnification. Most images are 2K or 4K, although a few are 1K.
 
 Note: to delete all generated PNGs, navigate to the Tungsten WS2 data directory and use this command
-`find . -type f -regex ".*\.png" -not -name "1777865_LAADF_fft.png" -delete`
+`find . -type f -regex ".*\\.png" -not -name "1777865_LAADF_fft.png" -delete`
 """
 
 import tomllib
 from pathlib import Path
-from dataclasses import dataclass
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
@@ -25,16 +24,21 @@ from matplotlib_scalebar.scalebar import ScaleBar
 import hyperspy.api as hs
 from tqdm import tqdm
 
-from channels import Channel, MultiChannelMetadata
+from .channels import Channel, MultiChannelMetadata
 
 
 class TungstenDataset(Dataset):
-    """Abstraction over the twisted WS2 dataset"""
+    """Abstraction over the twisted WS2 dataset
+
+    This Dataset handles loading channels from file, stacking them, and applying interpolations and cropping.
+    Normalisations are also performed here. A single image is kept back from the dataset to be used as a validation
+    example.
+    """
 
     DATA_DIRECTORY = Path("data/Twisted WS2/raw_images")
     BLACKLIST_FILE = Path("noise2void/datasets/tungsten_dataset_blacklist.txt")
 
-    def __init__(self, image_size: int, channels: list[Channel], px_scale: float):
+    def __init__(self, image_size: int, channels: list[Channel], px_scale: float, example_index: int | None = None):
         """
         Parameters
         ----------
@@ -44,6 +48,8 @@ class TungstenDataset(Dataset):
             The channels that must be included with each image
         px_scale: float
             The pixel size, in nanometres. Images with similar `px_scale` will be interpolated to match this value
+        example_index: int | None
+            The index of the reserved validation image to hold back. None specifies a random selection.
         """
         print("Initialising Dataset")
         assert len(set(channels)) == len(channels)
@@ -87,15 +93,41 @@ class TungstenDataset(Dataset):
         ])
 
         self.sample_filegroups = self._to_scale_sample_filegroups
+        assert len(self.sample_filegroups) > 1
+        if example_index is None:
+            self._reserved_example_meta = self.sample_filegroups.pop(  # Randomly select an example
+                int(torch.randint(0, len(self.sample_filegroups), (1,))[0])
+            )
+        else:
+            self._reserved_example_meta = self.sample_filegroups.pop(example_index)
+        self._reserved_example: torch.Tensor | None = None
 
-    def load_interpolate_crop(self, meta: MultiChannelMetadata) -> torch.Tensor:
-        """Loads, interpolates and crops the multi-channel image specified by the index"""
+    def load_interpolate_random_crop(self, meta: MultiChannelMetadata) -> torch.Tensor:
+        """Loads, interpolates and crops the multi-channel image"""
 
         datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
         interp_factor = meta.px_scale / self.px_scale
         datum = tforms.functional.resize(datum, int(interp_factor * meta.shape))  # Interpolate to correct scale
         datum = self._transform(datum)  # Randomly crop
         return datum
+
+    def load_interpolate_crop(self, meta: MultiChannelMetadata, crop_size: int) -> torch.Tensor:
+        """Loads, interpolates and deterministically crops"""
+
+        datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
+        interp_factor = meta.px_scale / self.px_scale
+        datum = tforms.functional.resize(datum, int(interp_factor * meta.shape))  # Interpolate to correct scale
+        datum = tforms.functional.center_crop(datum, crop_size)
+        return datum
+
+    @property
+    def reserved_example(self):
+        """A cropped and normalised example held back from the training set for validations."""
+
+        if self._reserved_example is None:
+            datum = self.load_interpolate_crop(self._reserved_example_meta, 1024)
+            self._reserved_example = self.normalise(datum)  # The example for validations
+        return self._reserved_example
 
     @staticmethod
     def normalise(datum: torch.Tensor) -> torch.Tensor:
@@ -113,7 +145,7 @@ class TungstenDataset(Dataset):
     def __getitem__(self, index: int) -> torch.Tensor:
         """Loads, interpolates and randomly crops from the specified multi-channel image"""
 
-        datum = self.load_interpolate_crop(self.sample_filegroups[index])
+        datum = self.load_interpolate_random_crop(self.sample_filegroups[index])
         datum = self.normalise(datum)
         return datum
 

@@ -25,7 +25,10 @@ import torch.nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from unet import UNet
+import matplotlib.pyplot as plt
+from matplotlib_scalebar.scalebar import ScaleBar
+
+from models.unet import UNet
 
 CPU = torch.device('cpu')
 
@@ -36,10 +39,11 @@ class TrainConfig:
 
     learning_rate: float        # Adam optimiser learning rate
     batch_size: int             # The number of images in each batch
-    epochs: int                 # Total number of eopchs to train for
+    epochs: int                 # Total number of epochs to train for
     spacing: int                # Spacing between null/dead pixels in the Noise2Void technique
     image_shape: int            # The size of each image in the batch
     log_dir: pathlib.Path       # Where to save the training loss log
+    px_scale: float             # The size of pixels in nanometres, for plotting
     test_fraction: float = 0.2  # Fraction of the dataset to be used for testing
 
 
@@ -60,7 +64,7 @@ class Trainer:
         model: nn.Module
             The model being trained.
         test_image: torch.Tensor
-            A pre-normalised (1, channels, image_shape, image_shape) tensor used to visualise learning
+            A pre-normalised (channels, image_shape, image_shape) tensor used to visualise learning
         """
 
         self.dataset = dataset
@@ -68,15 +72,20 @@ class Trainer:
         self.spacing = config.spacing
         self.epochs = config.epochs
         self.learning_rate = config.learning_rate
+        self.px_scale = config.px_scale
         self.test_image = test_image
-        self.log_writer = SummaryWriter(log_dir=config.log_dir)
+        self.log_writer = SummaryWriter(log_dir=str(config.log_dir))
 
         self.num_test_images = max(int(config.test_fraction * len(self.dataset)), 1)
         self.num_train_images = len(self.dataset) - self.num_test_images
         self.batch_size = min(config.batch_size, self.num_test_images)
+        self.device = torch.device("cuda:1")
+
+        self.plot_savedir = pathlib.Path(config.log_dir) / "epoch_plots"
+        self.plot_savedir.mkdir(parents=True, exist_ok=False)
 
         self.cpu_workers = max(1, min(self.batch_size, 40))
-        self.mask_grid = self.generate_grid(config.image_shape, config.image_shape, config.spacing)
+        self.mask_grid = self.generate_grid((config.image_shape, config.image_shape), config.spacing, 2)
 
     def train_model(self):
         """Train the model!
@@ -89,7 +98,7 @@ class Trainer:
 
         # Constant device arrays
         mask_grid_dev = self.mask_grid.to(self.device)
-        test_image = self.test_image.to(self.device)
+        test_image = self.test_image[None, ...].to(self.device)
 
         criterion = MSELoss()
         # criterion = L1Loss()
@@ -99,7 +108,9 @@ class Trainer:
         test_steps = int(test_frames / self.batch_size)
 
         self.model.to(self.device)
-        for _ in range(self.epochs):
+        batch_train_counter, batch_test_counter = 0, 0
+        for epoch_index in range(self.epochs):
+            print(f"Epoch {epoch_index:03d} of {self.epochs:03d}")
             epoch_train_loss, epoch_test_loss = 0.0, 0.0
             self.model.train()
 
@@ -118,9 +129,10 @@ class Trainer:
                 loss.backward()
                 optimiser.step()
 
-                loss = loss.cpu().detatch().numpy()
+                loss = loss.cpu().detach().numpy()
                 epoch_train_loss += loss
-                self.log_writer.add_scalar("BatchLoss/train", loss)
+                self.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
+                batch_train_counter += 1
 
             with torch.no_grad():
                 self.model.eval()
@@ -134,29 +146,45 @@ class Trainer:
                     prediction = self.model(x)
                     loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
 
-                    loss = loss.cpu().detatch().numpy()
+                    loss = loss.cpu().detach().numpy()
                     epoch_test_loss += loss
-                    self.log_writer.add_scalar("BatchLoss/test", loss)
+                    self.log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
+                    batch_test_counter += 1
 
             # Record training progress
             epoch_train_loss /= train_steps  # Average over batches because there's a different number of batches
             epoch_test_loss /= test_steps    # in the test and train parts
-            self.log_writer.add_scalar("EpochLoss/train", epoch_train_loss)
-            self.log_writer.add_scalar("EpochLoss/test", epoch_test_loss)
-            self.plot_test_image(self.model(test_image).detatch().cpu().numpy(), "EpochImage")
+            self.log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch_index)
+            self.log_writer.add_scalar("EpochLoss/test", epoch_test_loss, global_step=epoch_index)
+            self.plot_test_image(
+                test_image.cpu(), self.model(test_image).detach().cpu(), "EpochImage", epoch_index
+            )
 
         self.model.to(torch.device('cpu'))
         return
 
-    def plot_test_image(self, test_image: torch.Tensor, tag: str):
+    def plot_test_image(self, test_image: torch.Tensor, test_image_output: torch.Tensor, tag: str, epoch_index: int):
         """Plots a test image with tensorboard"""
 
         assert len(test_image.shape) == 4 and test_image.shape[0] == 1
         chans = test_image.shape[1]
         if chans == 1:
-            self.log_writer.add_image(tag, test_image[0, 0], dataformats="HW")
+            self.log_writer.add_image(tag, test_image_output[0, 0], dataformats="HW", global_step=epoch_index)
         else:
-            self.log_writer.add_images(tag, test_image[0], dataformats="CHW")
+            self.log_writer.add_images(tag, test_image_output[0], dataformats="CHW", global_step=epoch_index)
+
+        gridspec_kw = dict(left=0, right=1, bottom=0, top=1, wspace=0, hspace=0)
+        fig, axes = plt.subplots(2, chans, gridspec_kw=gridspec_kw, figsize=(chans * 8, 16))
+        for row_index, im in enumerate((test_image, test_image_output)):
+            for chan_index in range(chans):
+                axes[row_index, chan_index].imshow(
+                    im[0, chan_index], cmap="inferno", interpolation=None, vmin=0, vmax=1
+                )
+                axes[row_index, chan_index].axis("off")
+        sbar = ScaleBar(self.px_scale, "nm", location="lower right", color='w', box_color='k', box_alpha=0.7)
+        axes[-1, -1].add_artist(sbar)
+        fig.savefig(self.plot_savedir / f"epoch_{epoch_index:03d}.png")
+        plt.close(fig)
 
     def apply_mean(self, image_batch: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Replaces pixels in the image_batch with their local mean. Pixels are chosen by the mask.
@@ -170,7 +198,7 @@ class Trainer:
         return torch.from_numpy(void_image_batch(image_batch.numpy(), mask.numpy(), self.spacing))
 
     @staticmethod
-    def generate_grid(grid_shape: tuple[int, int], distance: int, jitter: int) -> np.ndarray:
+    def generate_grid(grid_shape: tuple[int, int], distance: int, jitter: int) -> torch.Tensor:
         """Generates an image masked in a grid-shape where mask-points are no closer than distance from themselves or
         the edges."""
 

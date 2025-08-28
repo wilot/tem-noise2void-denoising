@@ -205,7 +205,7 @@ class UNet(nn.Module):
             skip_features.append(x)
         x = self.bottleneck_block(x)
         for decoder_block, skip_feature in zip(self.decoder_blocks, reversed(skip_features)):
-            x = decoder_block(x)
+            x = decoder_block(x, skip_feature)
         x = self.head_block(x)
         return x
 

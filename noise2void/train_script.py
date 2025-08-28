@@ -3,49 +3,62 @@
 Trains a U-Net with the Noise2Void training scheme. Must be run as a script.
 """
 
-import time
 import shutil
 from pathlib import Path
 
+import torch
 import hydra
 from omegaconf import DictConfig
 
-from dataset import ExperimentalRecentDataset
+from datasets.channels import Channel
+from datasets.tungsten_dataset import TungstenDataset
 from trainer import Trainer, TrainConfig
 from models import UNet
 
 assert __name__ == '__main__'  # Don't import this!
 
+PROJECT_DIR = Path(__file__).parents[1]
 
-def setup_rundir(run_path: str):
-    """Creates the run-path if necessary, validates and cloned the code/config there"""
 
-    run_path = Path(run_path)
-    if run_path.parts[1] == "{SAMPLE_NAME}":
+def setup_rundir(run_path: str) -> Path:
+    """Creates the run-path if necessary, validates and cloned the code/config there.
+
+    The run-path can be created as the next increment over the previous existing one i.e. run_001. The code is copied
+    to this newly created run directory, and the directory path is returned.
+    """
+
+    run_path = PROJECT_DIR /  Path(run_path)
+    if run_path.parts[-2] == "{SAMPLE_NAME}":
         raise ValueError("Config value for run_directory not set!")
 
     if not run_path.parent.exists():
-        run_path.parent.mkdir()
+        print(f"{run_path.parent=} does not exist, creating")
+        run_path.parent.mkdir(parents=True)
 
-    if run_path.parts[-1][:-3] == "NNN":  # Just make the next available number
-        existing_runs = run_path.parent.glob("run???")
-        existing_runs = filter(lambda path: path.is_dir, existing_runs)
-        last_run = sorted(existing_runs, key=lambda path: path.name[-3:])[-1]
-        last_run_index = int(last_run.name[-3:])
-        run_path = run_path.with_name(f"run{last_run_index + 1:03d}")
+    if "{index}" in run_path.parts[-1]:  # Just make the next available number
+        existing_runs = run_path.parent.glob("run_???")
+        existing_runs = list(filter(lambda path: path.is_dir, existing_runs))
+        if len(existing_runs) == 0:
+            run_path = run_path.with_name(f"run_{0:03d}")
+        else:
+            last_run = sorted(existing_runs, key=lambda path: path.name[-3:])[-1]
+            last_run_index = int(last_run.name[-3:])
+            run_path = run_path.with_name(f"run_{last_run_index + 1:03d}")
 
     run_path.mkdir(exist_ok=False)
-    code_dir = Path("noise2void")
+    code_dir = PROJECT_DIR / Path("noise2void")
     shutil.copytree(code_dir, run_path / "noise2void")
+    return run_path
 
 
-def configure_model(model_config: DictConfig):
+def configure_model(model_config: DictConfig, channels: int) -> UNet:
+    """Creates a model as specified by the config file"""
 
-    if model_config.model == "UNet":
+    if model_config.name == "UNet":
         model = UNet(
-            input_channels=model_config.channels, output_channels=model_config.channels, num_layers=model_config.depth,
+            input_channels=channels, output_channels=channels, num_layers=model_config.depth,
             first_layer_channels=model_config.first_layer_channels,
-            first_layer_kernel_size=model_config.first_layer_kernel_size, activation=None
+            first_layer_kernel_size=model_config.initial_kernel_size, activation=None
         )
     else:
         raise NotImplementedError()
@@ -53,22 +66,37 @@ def configure_model(model_config: DictConfig):
     return model
 
 
-def configure_dataset(dataset_config: DictConfig):
+def configure_dataset(dataset_config: DictConfig, channels: list[str], image_size: int):
 
-    # TODO
-    ...
+    channels = [Channel(chan) for chan in channels]
+    dset = TungstenDataset(image_size, channels, dataset_config.px_scale, dataset_config.example_index)
+    return dset
 
 
-@hydra.main(config_path="noise2void", config_name="train_config.yaml")
+def save_trace_model(model: UNet, example_datum: torch.Tensor, savedir: Path, model_config: DictConfig):
+    """Saves the state-dict and then JIT traces/compiles the model with the example tensor."""
+
+    torch.save(model.state_dict(), savedir / model_config.state_savename)
+    traced_model: torch.jit.ScriptModule = torch.jit.trace(model, example_datum[None, ...])
+    traced_model.save(savedir / model_config.traced_savename)
+
+
+@hydra.main(config_path="", config_name="train_config.yaml", version_base=None)
 def main(config: DictConfig):
 
-    setup_rundir(config.run_directory)
-    model = configure_model(config.model)
-    dataset, test_image = configure_dataset(config.dataset)
+    # Validate and apply configs
+    run_path = setup_rundir(config.run_directory)
+    model = configure_model(config.model, len(config.channels))
+    dataset = configure_dataset(config.dataset, config.channels, config.image_size)
 
-    train_config = TrainConfig(**config.trainer)
-    trainer = Trainer(dataset, model, test_image, train_config)
+    train_config = TrainConfig(
+        **config.trainer, log_dir=run_path / "training_log", image_shape=config.image_size,
+        px_scale=config.dataset.px_scale
+    )
+    trainer = Trainer(dataset, model, dataset.reserved_example, train_config)
     trainer.train_model()
+
+    save_trace_model(model, dataset.reserved_example, run_path, config.model)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 Contains all the Noise2Void capable models.
 """
 
-from unet import UNet
+from .unet import UNet
 
 
 models = {
