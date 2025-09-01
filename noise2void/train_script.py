@@ -3,6 +3,7 @@
 Trains a U-Net with the Noise2Void training scheme. Must be run as a script.
 """
 
+import sys
 import shutil
 from pathlib import Path
 
@@ -10,10 +11,11 @@ import torch
 import hydra
 from omegaconf import DictConfig
 
-from datasets.channels import Channel
-from datasets.tungsten_dataset import TungstenDataset
-from trainer import Trainer, TrainConfig
-from models import UNet
+from noise2void.datasets.generators import dataset_generators
+from noise2void.models.generators import model_generators
+from noise2void.datasets.tungsten_dataset import TungstenDataset
+from noise2void.trainer import Trainer, TrainConfig
+from noise2void.models import UNet
 
 assert __name__ == '__main__'  # Don't import this!
 
@@ -51,28 +53,6 @@ def setup_rundir(run_path: str) -> Path:
     return run_path
 
 
-def configure_model(model_config: DictConfig, channels: int) -> UNet:
-    """Creates a model as specified by the config file"""
-
-    if model_config.name == "UNet":
-        model = UNet(
-            input_channels=channels, output_channels=channels, num_layers=model_config.depth,
-            first_layer_channels=model_config.first_layer_channels,
-            first_layer_kernel_size=model_config.initial_kernel_size, activation=None
-        )
-    else:
-        raise NotImplementedError()
-
-    return model
-
-
-def configure_dataset(dataset_config: DictConfig, channels: list[str], image_size: int):
-
-    channels = [Channel(chan) for chan in channels]
-    dset = TungstenDataset(image_size, channels, dataset_config.px_scale, dataset_config.example_index)
-    return dset
-
-
 def save_trace_model(model: UNet, example_datum: torch.Tensor, savedir: Path, model_config: DictConfig):
     """Saves the state-dict and then JIT traces/compiles the model with the example tensor."""
 
@@ -81,13 +61,21 @@ def save_trace_model(model: UNet, example_datum: torch.Tensor, savedir: Path, mo
     traced_model.save(savedir / model_config.traced_savename)
 
 
-@hydra.main(config_path="", config_name="train_config.yaml", version_base=None)
+@hydra.main(config_path="", config_name="config.yaml", version_base=None)
 def main(config: DictConfig):
 
     # Validate and apply configs
     run_path = setup_rundir(config.run_directory)
-    model = configure_model(config.model, len(config.channels))
-    dataset = configure_dataset(config.dataset, config.channels, config.image_size)
+
+    if config.model.name not in model_generators:
+        print(f"Model not recognized: {config.model.name}")
+        sys.exit(2)
+    model = model_generators[config.model.name](config)
+
+    if config.dataset.type not in dataset_generators:
+        print(f"Dataset not recognized: {config.dataset.type}")
+        sys.exit(2)
+    dataset: TungstenDataset = dataset_generators[config.dataset.type](config)
 
     train_config = TrainConfig(
         **config.trainer, log_dir=run_path / "training_log", image_shape=config.image_size,

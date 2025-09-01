@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 from matplotlib_scalebar.scalebar import ScaleBar
 
-from models.unet import UNet
+from noise2void.models.unet import UNet
 
 CPU = torch.device('cpu')
 
@@ -132,6 +132,19 @@ class Trainer:
                 loss = loss.cpu().detach().numpy()
                 epoch_train_loss += loss
                 self.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
+
+                # Monitor convergence metrics
+                self.log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
+                self.log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
+                gradients = [
+                    param.grad.detach().flatten()
+                    for param in self.model.parameters()
+                    if param.grad is not None
+                ]
+                gradient_norm = torch.cat(gradients).norm()
+                self.log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
+
+
                 batch_train_counter += 1
 
             with torch.no_grad():
@@ -169,16 +182,18 @@ class Trainer:
         assert len(test_image.shape) == 4 and test_image.shape[0] == 1
         chans = test_image.shape[1]
         if chans == 1:
-            self.log_writer.add_image(tag, test_image_output[0, 0], dataformats="HW", global_step=epoch_index)
+            im = ((test_image_output[0, 0] + 1.0) * 128.).to(torch.uint8)
+            self.log_writer.add_image(tag, im, dataformats="HW", global_step=epoch_index)
         else:
-            self.log_writer.add_images(tag, test_image_output[0], dataformats="CHW", global_step=epoch_index)
+            im = ((test_image_output[0] + 1.0) * 128.).to(torch.uint8)
+            self.log_writer.add_images(tag, im, dataformats="CHW", global_step=epoch_index)
 
         gridspec_kw = dict(left=0, right=1, bottom=0, top=1, wspace=0, hspace=0)
         fig, axes = plt.subplots(2, chans, gridspec_kw=gridspec_kw, figsize=(chans * 8, 16))
         for row_index, im in enumerate((test_image, test_image_output)):
             for chan_index in range(chans):
                 axes[row_index, chan_index].imshow(
-                    im[0, chan_index], cmap="inferno", interpolation=None, vmin=0, vmax=1
+                    im[0, chan_index], cmap="inferno", interpolation=None, vmin=-1, vmax=1
                 )
                 axes[row_index, chan_index].axis("off")
         sbar = ScaleBar(self.px_scale, "nm", location="lower right", color='w', box_color='k', box_alpha=0.7)

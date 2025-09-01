@@ -24,10 +24,10 @@ from matplotlib_scalebar.scalebar import ScaleBar
 import hyperspy.api as hs
 from tqdm import tqdm
 
-from .channels import Channel, MultiChannelMetadata
+from noise2void.datasets.channels import Channel, MultiChannelMetadata, MultiChannelDataset
 
 
-class TungstenDataset(Dataset):
+class TungstenDataset(Dataset, MultiChannelDataset):
     """Abstraction over the twisted WS2 dataset
 
     This Dataset handles loading channels from file, stacking them, and applying interpolations and cropping.
@@ -45,7 +45,7 @@ class TungstenDataset(Dataset):
         image_size: int
             The size of each image in pixels. Outputs will be randomly cropped
         channels: list[Channel]
-            The channels that must be included with each image
+            The channels that must be included with each image. This is in-order!
         px_scale: float
             The pixel size, in nanometres. Images with similar `px_scale` will be interpolated to match this value
         example_index: int | None
@@ -53,11 +53,11 @@ class TungstenDataset(Dataset):
         """
         print("Initialising Dataset")
         assert len(set(channels)) == len(channels)
-        self.channels = channels
+        self._channels = channels
         self.image_size = image_size
         self.px_scale = px_scale
         print("Finding filepaths")
-        self._all_sample_filegroups = self._find_filepaths()
+        self._all_sample_filegroups = self._find_filepaths(self.channels)
         print("Fetching scales and shapes")
         for meta in self._all_sample_filegroups:
             meta.fetch_scale_shape()
@@ -92,50 +92,99 @@ class TungstenDataset(Dataset):
             # tforms.RandomVerticalFlip(),
         ])
 
-        self.sample_filegroups = self._to_scale_sample_filegroups
+        self._sample_filegroups = self._to_scale_sample_filegroups
         assert len(self.sample_filegroups) > 1
         if example_index is None:
-            self._reserved_example_meta = self.sample_filegroups.pop(  # Randomly select an example
-                int(torch.randint(0, len(self.sample_filegroups), (1,))[0])
+            self._reserved_example_meta = self._sample_filegroups.pop(  # Randomly select an example
+                int(torch.randint(0, len(self._sample_filegroups), (1,))[0])
             )
         else:
-            self._reserved_example_meta = self.sample_filegroups.pop(example_index)
+            self._reserved_example_meta = self._sample_filegroups.pop(example_index)
         self._reserved_example: torch.Tensor | None = None
 
-    def load_interpolate_random_crop(self, meta: MultiChannelMetadata) -> torch.Tensor:
-        """Loads, interpolates and crops the multi-channel image"""
+    def load_interpolate(self, meta: MultiChannelMetadata) -> torch.Tensor:
+        """Loads and interpolates the multi-channel image"""
 
         datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
         interp_factor = meta.px_scale / self.px_scale
-        datum = tforms.functional.resize(datum, int(interp_factor * meta.shape))  # Interpolate to correct scale
+        interp_shape = int(interp_factor * meta.shape)
+        if interp_shape % 16 != 0:  # Round this shape to the nearest factor of eight (for a 4 layer unet)
+            interp_shape += 16 - interp_shape % 16
+        datum = tforms.functional.resize(datum, interp_shape)  # Interpolate to correct scale
+        return datum[None, ...]
+
+    def uninterpolate(self, meta: MultiChannelMetadata, datum: torch.Tensor) -> torch.Tensor:
+        """Reverses any interpolation that would be applied to the image to make its magnification conform to the
+        dataset as a whole."""
+
+        datum = tforms.functional.resize(datum, meta.shape)
+        return datum
+
+    def _load_interpolate_random_crop(self, meta: MultiChannelMetadata) -> torch.Tensor:
+        """Loads, interpolates and crops the multi-channel image"""
+
+        datum = self.load_interpolate(meta)
         datum = self._transform(datum)  # Randomly crop
         return datum
 
-    def load_interpolate_crop(self, meta: MultiChannelMetadata, crop_size: int) -> torch.Tensor:
+    def _load_interpolate_crop(self, meta: MultiChannelMetadata, crop_size: int) -> torch.Tensor:
         """Loads, interpolates and deterministically crops"""
 
-        datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
-        interp_factor = meta.px_scale / self.px_scale
-        datum = tforms.functional.resize(datum, int(interp_factor * meta.shape))  # Interpolate to correct scale
+        datum = self.load_interpolate(meta)
         datum = tforms.functional.center_crop(datum, crop_size)
         return datum
 
     @property
-    def reserved_example(self):
+    def reserved_example(self) -> torch.Tensor:
         """A cropped and normalised example held back from the training set for validations."""
 
         if self._reserved_example is None:
-            datum = self.load_interpolate_crop(self._reserved_example_meta, 1024)
+            datum = self._load_interpolate_crop(self._reserved_example_meta, 1024)
             self._reserved_example = self.normalise(datum)  # The example for validations
         return self._reserved_example
+
+    @property
+    def sample_filegroups(self):
+        """Multichannel metadata for the file-froups"""
+
+        return self._sample_filegroups
+
+    @property
+    def channels(self) -> list[Channel]:
+        """The order in which each channel is stored in the arrays"""
+
+        return self._channels
 
     @staticmethod
     def normalise(datum: torch.Tensor) -> torch.Tensor:
         """Normalises the image between zero and one"""
 
-        datum -= torch.amin(datum, dim=(-2, -1), keepdim=True)
-        datum /= torch.amax(datum, dim=(-2, -1), keepdim=True)
+        datum -= torch.mean(datum, dim=(-2, -1), keepdim=True)
+        datum /= torch.std(datum, dim=(-2, -1), keepdim=True) * 5
+        datum = torch.tanh(datum)
+
+        # datum -= torch.amin(datum, dim=(-2, -1), keepdim=True)
+        # datum /= torch.amax(datum, dim=(-2, -1), keepdim=True)
         return datum
+
+    @classmethod
+    def get_savename(cls, meta: MultiChannelMetadata) -> Path:
+        """Returns the savepath, according to this dataset's saving convention, for this datum. This savepath is
+        has any channel in the filename removed."""
+
+        if meta.sample in ("Apr25_tWS2_1", "Apr25_tWS2_2"):
+            savename = meta.fpaths[Channel.HAADF].name.replace("HAADF_", '')
+        elif meta.sample in ("May25_tWS2_4"):
+            chan, mag, index = meta.fpaths[Channel.HAADF].stem.split("_")
+            savename = index + meta.fpaths[Channel.HAADF].suffix
+        elif meta.sample in ("Jul24_tWS2_1", "Jul24_tWS2_3"):
+            mag, chan, index = meta.fpaths[Channel.HAADF].stem.split("_")
+            savename = index + meta.fpaths[Channel.HAADF].suffix
+        else:
+            raise ValueError(f"Unknown sample {meta.sample}")
+        savepath = meta.fpaths[Channel.HAADF].parent / savename  # This is the path relative to project root
+        savepath = savepath.relative_to(cls.DATA_DIRECTORY)  # This is relative to this dataset's data directory
+        return savepath
 
     def __len__(self) -> int:
         """The number of images in the dataset. Note random crops are applied, so the effective number is larger."""
@@ -145,18 +194,26 @@ class TungstenDataset(Dataset):
     def __getitem__(self, index: int) -> torch.Tensor:
         """Loads, interpolates and randomly crops from the specified multi-channel image"""
 
-        datum = self.load_interpolate_random_crop(self.sample_filegroups[index])
+        datum = self._load_interpolate_random_crop(self.sample_filegroups[index])
         datum = self.normalise(datum)
         return datum
 
     @classmethod
-    def _find_filepaths(cls) -> list[MultiChannelMetadata]:
-        """Constructs the dictionary of filepaths in the experimental dataset
+    def _find_filepaths(cls, channel_order: list[Channel]) -> list[MultiChannelMetadata]:
+        """Constructs the dictionary of filepaths in the experimental dataset. Each channel in the multi-channel
+        images is saved in a separate file. Each file only contains a single image (there are no videos).
+
+        Parameters
+        ----------
+        channel_order: list[Channel]
+            The order in which to store the channels in the MultiChannelMetadata. This will match the way the channels
+            are arranged in the tensors!
 
         Returns
         -------
         dict[str, dict[int, dict[Channel, Path]]]
-            Dictionary of filepaths of the form `dict[sample-name][image-index][channel]`
+            Dictionary of filepaths of the form `dict[sample-name][image-index][channel]`. Only channels in
+            `channel_order` are considered.
         """
 
         sample_filedirs = {  # Different glob and pairing for each, yay!
@@ -223,8 +280,8 @@ class TungstenDataset(Dataset):
         sample_filegroups_list = list()
         for sample in sample_filegroups:
             for im_index in sample_filegroups[sample]:
-                sample_filegroups_list.append(
-                    MultiChannelMetadata(sample_filegroups[sample][im_index], sample, im_index)
+                sample_filegroups_list.append(  # This implicitly drops channels not in the `channel_order`!
+                    MultiChannelMetadata(sample_filegroups[sample][im_index], channel_order, sample, im_index, None)
                 )
 
         return sample_filegroups_list
@@ -337,10 +394,23 @@ if __name__ == "__main__":
     dset = TungstenDataset(512, [Channel.HAADF, Channel.BF], 0.007)
     dset.print_dataset_stats()
 
+    # Plot example images
     fig, axes = plt.subplots(len(dset.channels), 4, sharex=True, sharey=True)
     for col in axes.T:
         index = torch.randint(0, len(dset), (1,))[0]
         datum = dset[index]
         for chan_index in range(len(dset.channels)):
             col[chan_index].imshow(datum[chan_index], cmap="inferno", interpolation=None)
+    axes[0, 0].set_ylabel("HAADF")
+    axes[1, 0].set_ylabel("BF")
+
+    # Plot example histograms
+    fig, axes = plt.subplots(len(dset.channels), 4, sharex=True, sharey=True)
+    for col in axes.T:
+        index = torch.randint(0, len(dset), (1,))[0]
+        datum = dset[index]
+        for chan_index in range(len(dset.channels)):
+            col[chan_index].hist(datum[chan_index].flatten(), bins=64)
+    axes[0, 0].set_ylabel("HAADF")
+    axes[1, 0].set_ylabel("BF")
     plt.show(block=True)

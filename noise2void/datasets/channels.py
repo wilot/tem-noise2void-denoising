@@ -5,8 +5,10 @@ A type for HAADF, LAADF and BF channels in STEM.
 
 from enum import Enum
 from pathlib import Path
+from abc import ABC, abstractmethod
 
 import numpy as np
+import torch
 
 import hyperspy.api as hs
 
@@ -20,14 +22,31 @@ class Channel(Enum):
 
 
 class MultiChannelMetadata:
+    """Represents the metadata and file-paths of a multi-channel image or video."""
 
     def __init__(
-        self, fpaths: dict[Channel, Path], sample: str, index: int,
+        self, fpaths: dict[Channel, Path], channel_order: list[Channel], sample: str, index: int, frames: int | None
     ):
+        """
+        Parameters
+        ----------
+        fpaths: dict[Channel, Path]
+            A mapping of all the channels and the filepaths containing that channel's data
+        channel_order: list[Channel]
+            The memory layout of the channels. Any channel in the `fpaths` and not here will be dropped
+        sample: str
+            A tag identifying the sample
+        index: int
+            A unique index of this multi-channel image within the sample
+        frames: int | None
+            The number of frames, if the files contain each channel of the video, or None if it is an image
+        """
         assert len(fpaths) > 0
+        self.fpaths: dict[Channel, Path] = {chan: fpaths[chan] for chan in channel_order if chan in fpaths}
         self.fpaths: dict[Channel, Path] = fpaths
         self.sample = sample
         self.index = index
+        self.frames = frames
         self.px_scale: float | None = None
         self.shape: int | None = None
 
@@ -76,3 +95,46 @@ class MultiChannelMetadata:
             [hs.load(self.fpaths[chan]).data for chan in channels],
             axis=0
         )
+
+
+class MultiChannelDataset(ABC):
+    """A generic MultiChannel dataset"""
+
+    @property
+    @abstractmethod
+    def sample_filegroups(self) -> list[MultiChannelMetadata]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_interpolate(self, meta: MultiChannelMetadata) -> torch.Tensor:
+        """Load and interpolate the image/video, returning a torch `Tensor` of shape [frames, channels, H, W]"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def uninterpolate(selfself, meta: MultiChannelMetadata, datum: torch.Tensor) -> torch.Tensor:
+        """Reverses any interpolation that would be applied to the image to make its magnification conform to the
+        dataset"""
+        raise NotImplemented
+
+    @staticmethod
+    @abstractmethod
+    def normalise(datum: torch.Tensor) -> torch.Tensor:
+        """Normalise tensors of shape [frames, channels, H, W]"""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def reserved_example(self) -> torch.Tensor:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def channels(self) -> list[Channel]:
+        """The arrangement of channels in the data"""
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def get_savename(cls, meta: MultiChannelMetadata) -> str:
+        """Returns an appropriate savename, according to this dataset's conventions, for this datum."""
+        raise NotImplementedError
