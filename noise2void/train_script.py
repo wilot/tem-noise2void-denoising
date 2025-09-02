@@ -1,6 +1,7 @@
 """Train Script
 
-Trains a U-Net with the Noise2Void training scheme. Must be run as a script.
+Trains a U-Net with the Noise2Void training scheme. The dataset and model are configured with the `config.yaml`
+file. After training, the model weights are saved. Then a traced TorchScript module is saved of the same model.
 """
 
 import sys

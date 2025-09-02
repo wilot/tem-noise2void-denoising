@@ -38,7 +38,10 @@ class TungstenDataset(Dataset, MultiChannelDataset):
     DATA_DIRECTORY = Path("data/Twisted WS2/raw_images")
     BLACKLIST_FILE = Path("noise2void/datasets/tungsten_dataset_blacklist.txt")
 
-    def __init__(self, image_size: int, channels: list[Channel], px_scale: float, example_index: int | None = None):
+    def __init__(
+        self, image_size: int, channels: list[Channel], px_scale: float, example_index: int | None = None,
+            crop_bounds: int=4
+    ):
         """
         Parameters
         ----------
@@ -50,12 +53,15 @@ class TungstenDataset(Dataset, MultiChannelDataset):
             The pixel size, in nanometres. Images with similar `px_scale` will be interpolated to match this value
         example_index: int | None
             The index of the reserved validation image to hold back. None specifies a random selection.
+        crop_bounds: int
+            Each image will be cropped to the nearest 2^`crop_bounds` to work with a unet of `crop-bounds` depth
         """
         print("Initialising Dataset")
         assert len(set(channels)) == len(channels)
         self._channels = channels
         self.image_size = image_size
         self.px_scale = px_scale
+        self.crop_bounds = crop_bounds
         print("Finding filepaths")
         self._all_sample_filegroups = self._find_filepaths(self.channels)
         print("Fetching scales and shapes")
@@ -108,10 +114,10 @@ class TungstenDataset(Dataset, MultiChannelDataset):
         datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
         interp_factor = meta.px_scale / self.px_scale
         interp_shape = int(interp_factor * meta.shape)
-        if interp_shape % 16 != 0:  # Round this shape to the nearest factor of eight (for a 4 layer unet)
-            interp_shape += 16 - interp_shape % 16
+        if interp_shape % 2**self.crop_bounds != 0:  # Round this shape to the nearest order of two
+            interp_shape += 2**self.crop_bounds - interp_shape % 2**self.crop_bounds
         datum = tforms.functional.resize(datum, interp_shape)  # Interpolate to correct scale
-        return datum[None, ...]
+        return datum
 
     def uninterpolate(self, meta: MultiChannelMetadata, datum: torch.Tensor) -> torch.Tensor:
         """Reverses any interpolation that would be applied to the image to make its magnification conform to the
@@ -211,9 +217,8 @@ class TungstenDataset(Dataset, MultiChannelDataset):
 
         Returns
         -------
-        dict[str, dict[int, dict[Channel, Path]]]
-            Dictionary of filepaths of the form `dict[sample-name][image-index][channel]`. Only channels in
-            `channel_order` are considered.
+        list[MultiChannelMetadata]
+            The metadata discovered.
         """
 
         sample_filedirs = {  # Different glob and pairing for each, yay!
@@ -286,7 +291,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
 
         return sample_filegroups_list
 
-    def print_dataset_stats(self):
+    def _print_dataset_stats(self):
         """Prints sample-wise details about the samples' images, including image sizes and channels used."""
 
         # Count channels and ensure consistency
@@ -313,8 +318,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
             print(f"{sample:-^16}")
             image_shapes: list[int] = list()
             for meta in filter(lambda meta: meta.sample == sample, self._all_sample_filegroups):
-                im_shape = meta.shape
-                image_shapes.append(im_shape)
+                image_shapes.append(meta.shape)
             im_sizes, size_frequencies = np.unique(image_shapes, return_counts=True)
             print(f"Found image sizes: {im_sizes}")
             print(f"Frequencies: {size_frequencies}")
@@ -324,7 +328,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
         print(f"Images satisfying channels {self.channels}: {len(self._channel_sample_filegroups)}")
         print(f"Images satisfying mag constraints: {len(self._to_scale_sample_filegroups)}")
         print(f"Total images used: {len(self.sample_filegroups)}")
-        print(f"Effective number of {self.image_size}px images in dataset (after mag interpolation): {self.calculate_effective_length():.1E}")
+        print(f"Effective number of {self.image_size}px images in dataset (after mag interpolation): {self._calculate_effective_length():.1E}")
 
     def _plot_images(self):
         """Converts each multi-channel image to a PNG"""
@@ -357,7 +361,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
                 plt.close(fig)
                 pbar.update()
 
-    def calculate_effective_length(self) -> float:
+    def _calculate_effective_length(self) -> float:
         """Calculates the effective length of the dataset, taking into account interpolation and tiled cropping"""
 
         total = 0.0
@@ -392,7 +396,7 @@ if __name__ == "__main__":
     # For getting info on the samples and plotting etc.
 
     dset = TungstenDataset(512, [Channel.HAADF, Channel.BF], 0.007)
-    dset.print_dataset_stats()
+    dset._print_dataset_stats()
 
     # Plot example images
     fig, axes = plt.subplots(len(dset.channels), 4, sharex=True, sharey=True)
