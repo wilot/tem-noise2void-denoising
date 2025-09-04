@@ -16,13 +16,17 @@ Trains the UNets with Noise2Void training regime.
 
 """
 
+import os
 import pathlib
 from dataclasses import dataclass
 
 import numpy as np
 import numba as nb
 import torch.nn
-from torch.utils.data import Dataset, DataLoader, random_split
+import torch.distributed
+import torch.nn.parallel
+import torch.multiprocessing as mp
+import torch.utils.data
 from torch.utils.tensorboard import SummaryWriter
 
 import matplotlib.pyplot as plt
@@ -38,7 +42,7 @@ class TrainConfig:
     """The runtime configuration for the model training"""
 
     learning_rate: float        # Adam optimiser learning rate
-    batch_size: int             # The number of images in each batch
+    batch_size: int             # The number of images in each batch, if distributed this is per-device
     epochs: int                 # Total number of epochs to train for
     spacing: int                # Spacing between null/dead pixels in the Noise2Void technique
     image_shape: int            # The size of each image in the batch
@@ -47,10 +51,30 @@ class TrainConfig:
     test_fraction: float = 0.2  # Fraction of the dataset to be used for testing
 
 
+@dataclass
+class DistributedProcessConfig:
+    """The parameters passed to each distributed training process."""
+
+    model: torch.nn.Module
+    train_dataloader: torch.utils.data.DataLoader
+    test_dataloader: torch.utils.data.DataLoader
+    train_sampler: torch.utils.data.distributed.DistributedSampler
+    test_sampler: torch.utils.data.distributed.DistributedSampler
+    mask_grid: np.ndarray
+    validation_image: torch.Tensor
+    learning_rate: float
+    epochs: int
+    log_writer: SummaryWriter
+    rank: int
+    world_size: int
+
+
 class Trainer:
     """Trains a model according to the Noise2Void technique."""
 
-    def __init__(self, dataset: Dataset, model: UNet, test_image: torch.Tensor, config: TrainConfig) -> None:
+    def __init__(
+            self, dataset: Dataset, model: UNet, distributed: bool, test_image: torch.Tensor, config: TrainConfig
+    ) -> None:
         """Performs training on a UNet model with Noise2Void training.
 
         Generates a Noise2Void grid and applies the grid, deletes information in the input at those gridpoints, and
@@ -63,6 +87,8 @@ class Trainer:
             channels corresponding to ADF and BF channels in that order.
         model: nn.Module
             The model being trained.
+        distributed: bool
+            Whether to run on a single GPU or distributed across several
         test_image: torch.Tensor
             A pre-normalised (channels, image_shape, image_shape) tensor used to visualise learning
         """
@@ -74,12 +100,16 @@ class Trainer:
         self.learning_rate = config.learning_rate
         self.px_scale = config.px_scale
         self.test_image = test_image
+        self.distributed = distributed
         self.log_writer = SummaryWriter(log_dir=str(config.log_dir))
 
         self.num_test_images = max(int(config.test_fraction * len(self.dataset)), 1)
         self.num_train_images = len(self.dataset) - self.num_test_images
         self.batch_size = min(config.batch_size, self.num_test_images)
-        self.device = torch.device("cuda:1")
+        if not self.distributed:
+            torch.cuda.set_device(0)
+
+        self.train_dataloader, self.test_dataloader, self.train_frames, self.test_frames = self.generate_dataloaders()
 
         self.plot_savedir = pathlib.Path(config.log_dir) / "epoch_plots"
         self.plot_savedir.mkdir(parents=True, exist_ok=False)
@@ -87,14 +117,19 @@ class Trainer:
         self.cpu_workers = max(1, min(self.batch_size, 40))
         self.mask_grid = self.generate_grid((config.image_shape, config.image_shape), config.spacing, 2)
 
+    def train_distributed_model(self):
+        """Trains the model across several GPUs"""
+
+        # TODO: Implemented distributed training in a module function
+        mp.spawn(
+            self._train_distributed_instance()
+        )
+
     def train_model(self):
         """Train the model!
 
         Returns model to CPU memory when done.
         """
-
-        # Randomly split the dataset into test and train
-        train_dataloader, test_dataloader, train_frames, test_frames = self.generate_dataloaders()
 
         # Constant device arrays
         mask_grid_dev = self.mask_grid.to(self.device)
@@ -104,8 +139,8 @@ class Trainer:
         # criterion = L1Loss()
         optimiser = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
-        train_steps = int(train_frames / self.batch_size)
-        test_steps = int(test_frames / self.batch_size)
+        train_steps = int(self.train_frames / self.batch_size)
+        test_steps = int(self.test_frames / self.batch_size)
 
         self.model.to(self.device)
         batch_train_counter, batch_test_counter = 0, 0
@@ -115,7 +150,7 @@ class Trainer:
             self.model.train()
 
             # For each train batch
-            for image_batch in train_dataloader:
+            for image_batch in self.train_dataloader:
 
                 x = self.apply_mean(
                     image_batch.detach().clone(), self.mask_grid
@@ -149,7 +184,7 @@ class Trainer:
 
             with torch.no_grad():
                 self.model.eval()
-                for image_batch in test_dataloader:
+                for image_batch in self.test_dataloader:
 
                     x = self.apply_mean(
                         image_batch.detach().clone(), self.mask_grid
@@ -243,11 +278,11 @@ class Trainer:
         grid = torch.from_numpy(grid)
         return grid
 
-    def generate_dataloaders(self) -> tuple[DataLoader, DataLoader, int, int]:
-        """Randomly splits the dataset into test and train.
-
-        If there are more data in the dataset than required test and train images, the dataset is trimmed here. However
-        if there are fewer data in the dataset than number of test and train images required, throws assertion error.
+    def generate_dataloaders(
+        self, rank:int | None=None, world_size: int | None=None
+    ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, int, int]:
+        """Randomly splits the dataset into test and train. Uses a distributed sampler if distributed. If so, rank and
+        world_size must be specified
 
         Returns
         -------
@@ -255,17 +290,30 @@ class Trainer:
             The Train and test dataloaders respectively, along with the number of frames in the train and test sets.
         """
 
-        # assert self.num_test_images + self.num_train_images <= len(self.dataset)
-        # if self.num_train_images + self.num_test_images < len(self.dataset):  # Trim the dataset to size if needed
-        #     self.dataset = Subset(self.dataset, list(range(self.num_train_images + self.num_test_images)))
-
-        train_set, test_set = random_split(
+        train_set, test_set = torch.utils.data.random_split(
             self.dataset, (self.num_train_images, self.num_test_images)
         )
-        train_dataloader, test_dataloader = [
-            DataLoader(dset, self.batch_size, shuffle=True, num_workers=self.cpu_workers, pin_memory=True)
-            for dset in (train_set, test_set)
-        ]
+
+        if self.distributed:
+            if rank is None or world_size is None:
+                raise ValueError("Rank and world size must be specified in a distributed context")
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_set, rank=rank, num_replicas=world_size
+            )
+            test_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_set, rank=rank, num_replicas=world_size
+            )
+        else:
+            train_sampler, test_sampler = None, None
+
+        train_dataloader = torch.utils.data.DataLoader(
+            train_set, self.batch_size, shuffle=(train_sampler is None), sampler=train_sampler,
+            num_workers=min(12, self.batch_size)
+        )
+        test_dataloader = torch.utils.data.DataLoader(
+            test_set, self.batch_size, shuffle=(test_sampler is None), sampler=test_sampler,
+            num_workers=min(12, self.batch_size)
+        )
 
         return train_dataloader, test_dataloader, len(train_set), len(test_set)
 
@@ -299,6 +347,63 @@ def numba_sum_reduce(arr: np.ndarray) -> np.ndarray:
         for ch in range(arr.shape[1]):
             res[f, ch] = np.sum(arr[f, ch])
     return res
+
+
+def _train_distributed_model(params: DistributedProcessConfig):
+    """Runs distributed training"""
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12345"
+    torch.distributed.init_process_group("nccl", rank=params.rank)
+    torch.cuda.set_device(params.rank)
+    device = torch.device(f"cuda:{params.rank}")
+
+    params.model.to(params.rank)
+    model = torch.nn.parallel.DistributedDataParallel(params.model, device_ids=[params.rank])
+
+    criterion = MSELoss()
+    optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
+    mask_grid_device = torch.from_numpy(params.mask_grid).to(device)  # A copy of the masking grid on GPU
+
+    batch_train_counter, batch_test_counter = 0, 0
+
+    model.train()
+    for epoch in range(params.epochs):
+        params.train_sampler.set_epoch(epoch)
+        params.test_sampler.set_epoch(epoch)
+        epoch_train_loss, epoch_test_loss = 0.0, 0.0
+
+        for image_batch in params.train_dataloader:
+
+            # Selectively mask a copy of the image, on the CPU
+            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid)
+            x = torch.from_numpy(x).to(device)  # Transfer to GPU
+            y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
+
+            prediction = model(x)
+            loss = criterion(prediction, y, mask_grid_device)
+
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+
+            # Logging, only done from rank 0
+            if params.rank == 0:
+                loss_value = loss.cpu().detach().numpy()
+                epoch_train_loss += loss_value
+                params.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
+
+                # Monitor convergence metrics
+                params.log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
+                params.log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
+                gradients = [
+                    param.grad.detach().flatten()
+                    for param in params.model.parameters()
+                    if param.grad is not None
+                ]
+                gradient_norm = torch.cat(gradients).norm()
+                params.log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
+
 
 
 class MSELoss(torch.nn.Module):
