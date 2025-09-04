@@ -5,7 +5,7 @@ Code to generate the datasets from config files.
 
 from noise2void.datasets.channels import Channel
 from noise2void.datasets.tungsten_dataset import TungstenDataset
-from noise2void.datasets.iridium_glc_dataset import IridiumDataset
+from noise2void.datasets.iridium_glc_dataset import IridiumVideoDataset
 
 
 def _generate_tungsten_from_config(config) -> TungstenDataset:
@@ -17,15 +17,14 @@ def _generate_tungsten_from_config(config) -> TungstenDataset:
     )
 
 
-def _generate_iridium_from_config(config) -> IridiumDataset:
+def _generate_iridium_video_from_config(config) -> IridiumVideoDataset:
     """Generates an IridiumDataset from config"""
 
-    # TODO: Implement
-    raise NotImplementedError
+    return IridiumVideoDataset(512, config.dataset.example_index)
 
 
 # A mapping from the string specified in every config file's dataset section to a method to generate it from that config
 dataset_generators = {
     "WS2": _generate_tungsten_from_config,
-    "IrGLC": _generate_iridium_from_config,
+    "IrGLCVideo": _generate_iridium_video_from_config,
 }

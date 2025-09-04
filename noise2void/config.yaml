@@ -21,7 +21,7 @@ trainer:
   test_fraction: 0.2
 
 dataset:
-  type: "WS2"
+  type: "IridiumGLCVideo"
   px_scale: 0.007   # Size of pixels in nanometres
   example_index: 5  # The index to reserve for validation
 

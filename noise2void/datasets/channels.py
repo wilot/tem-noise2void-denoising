@@ -45,7 +45,7 @@ class MultiChannelMetadata:
         self.fpaths: dict[Channel, Path] = {chan: fpaths[chan] for chan in channel_order if chan in fpaths}
         self.sample = sample
         self.index = index
-        self.frames = frames  # The number of valid frames, in the file
+        self.frames = frames  # The number of valid frames, not necessarily acceptable, in the file
         self.px_scale: float | None = None
         self.shape: int | None = None
 
@@ -97,7 +97,7 @@ class MultiChannelMetadata:
             )[None, ...]
         else:  # Stack the multi-channel videos
             return np.stack(
-                [hs.load(self.fpaths[chan]).data[:self.frames] for chan in channels],
+                [hs.load(self.fpaths[chan]).data for chan in channels],
                 axis=1
             )
 
