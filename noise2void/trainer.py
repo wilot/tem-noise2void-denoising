@@ -47,33 +47,35 @@ class TrainConfig:
     spacing: int                # Spacing between null/dead pixels in the Noise2Void technique
     image_shape: int            # The size of each image in the batch
     log_dir: pathlib.Path       # Where to save the training loss log
-    px_scale: float             # The size of pixels in nanometres, for plotting
+    px_scale: float | None      # The size of pixels in nanometres, for plotting
     test_fraction: float = 0.2  # Fraction of the dataset to be used for testing
 
 
 @dataclass
-class DistributedProcessConfig:
+class _TrainingProcessConfig:
     """The parameters passed to each distributed training process."""
 
     model: torch.nn.Module
-    train_dataloader: torch.utils.data.DataLoader
-    test_dataloader: torch.utils.data.DataLoader
-    train_sampler: torch.utils.data.distributed.DistributedSampler
-    test_sampler: torch.utils.data.distributed.DistributedSampler
+    train_dataset: torch.utils.data.Dataset
+    test_dataset: torch.utils.data.Dataset
     mask_grid: np.ndarray
     validation_image: torch.Tensor
+    void_size: int
     learning_rate: float
+    batch_size: int
     epochs: int
-    log_writer: SummaryWriter
-    rank: int
-    world_size: int
+    world_size: int | None
+    log_dir: pathlib.Path  # Where to save the training loss log
+    plot_dir: pathlib.Path
+    px_scale: float | None  # The size of pixels in nanometres, for plotting
 
 
 class Trainer:
     """Trains a model according to the Noise2Void technique."""
 
     def __init__(
-            self, dataset: Dataset, model: UNet, distributed: bool, test_image: torch.Tensor, config: TrainConfig
+            self, dataset: torch.utils.data.Dataset, model: UNet, distributed: bool, test_image: torch.Tensor,
+            config: TrainConfig
     ) -> None:
         """Performs training on a UNet model with Noise2Void training.
 
@@ -90,7 +92,7 @@ class Trainer:
         distributed: bool
             Whether to run on a single GPU or distributed across several
         test_image: torch.Tensor
-            A pre-normalised (channels, image_shape, image_shape) tensor used to visualise learning
+            A pre-normalised (1, channels, image_shape, image_shape) tensor used to visualise learning
         """
 
         self.dataset = dataset
@@ -101,7 +103,9 @@ class Trainer:
         self.px_scale = config.px_scale
         self.test_image = test_image
         self.distributed = distributed
-        self.log_writer = SummaryWriter(log_dir=str(config.log_dir))
+        self.log_dir = config.log_dir
+        self.plot_savedir = pathlib.Path(config.log_dir) / "epoch_plots"
+        self.plot_savedir.mkdir(parents=True, exist_ok=False)
 
         self.num_test_images = max(int(config.test_fraction * len(self.dataset)), 1)
         self.num_train_images = len(self.dataset) - self.num_test_images
@@ -109,21 +113,27 @@ class Trainer:
         if not self.distributed:
             torch.cuda.set_device(0)
 
-        self.train_dataloader, self.test_dataloader, self.train_frames, self.test_frames = self.generate_dataloaders()
-
-        self.plot_savedir = pathlib.Path(config.log_dir) / "epoch_plots"
-        self.plot_savedir.mkdir(parents=True, exist_ok=False)
+        self.train_dataset, self.test_dataset = self.split_datasets()
 
         self.cpu_workers = max(1, min(self.batch_size, 40))
         self.mask_grid = self.generate_grid((config.image_shape, config.image_shape), config.spacing, 2)
+        self.void_size = config.spacing - 2  # The area contributing information to each void/averaged pixel
 
     def train_distributed_model(self):
         """Trains the model across several GPUs"""
 
-        # TODO: Implemented distributed training in a module function
-        mp.spawn(
-            self._train_distributed_instance()
+        num_devices = torch.cuda.device_count()
+        train_params = _TrainingProcessConfig(
+            model=self.model, train_dataset=self.train_dataset, test_dataset=self.test_dataset,
+            mask_grid=self.mask_grid, validation_image=self.test_image, learning_rate=self.learning_rate,
+            batch_size=self.batch_size, epochs=self.epochs, world_size=num_devices, void_size=self.void_size,
+            log_dir=self.log_dir, plot_dir=self.plot_savedir, px_scale=self.px_scale
         )
+        mp.spawn(
+            _train_distributed_model,
+            args=(train_params,), nprocs=num_devices, join=True
+        )  # Waits until all processes rejoin/end
+        self.model.to(CPU)
 
     def train_model(self):
         """Train the model!
@@ -131,85 +141,94 @@ class Trainer:
         Returns model to CPU memory when done.
         """
 
-        # Constant device arrays
-        mask_grid_dev = self.mask_grid.to(self.device)
-        test_image = self.test_image[None, ...].to(self.device)
+        train_params = _TrainingProcessConfig(
+            model=self.model, train_dataset=self.train_dataset, test_dataset=self.test_dataset,
+            mask_grid=self.mask_grid, validation_image=self.test_image, batch_size=self.batch_size,
+            learning_rate=self.learning_rate, epochs=self.epochs, world_size=None, void_size=self.void_size,
+            log_dir=self.log_dir, plot_dir=self.plot_savedir, px_scale=self.px_scale
+        )
+        _train_model(train_params)
+        self.model.to(CPU)
 
-        criterion = MSELoss()
-        # criterion = L1Loss()
-        optimiser = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-
-        train_steps = int(self.train_frames / self.batch_size)
-        test_steps = int(self.test_frames / self.batch_size)
-
-        self.model.to(self.device)
-        batch_train_counter, batch_test_counter = 0, 0
-        for epoch_index in range(self.epochs):
-            print(f"Epoch {epoch_index:03d} of {self.epochs:03d}")
-            epoch_train_loss, epoch_test_loss = 0.0, 0.0
-            self.model.train()
-
-            # For each train batch
-            for image_batch in self.train_dataloader:
-
-                x = self.apply_mean(
-                    image_batch.detach().clone(), self.mask_grid
-                ).to(self.device)  # Selectively mask a copy
-                y = image_batch.to(self.device)
-
-                prediction = self.model(x)
-                loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
-
-                optimiser.zero_grad()
-                loss.backward()
-                optimiser.step()
-
-                loss = loss.cpu().detach().numpy()
-                epoch_train_loss += loss
-                self.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
-
-                # Monitor convergence metrics
-                self.log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
-                self.log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
-                gradients = [
-                    param.grad.detach().flatten()
-                    for param in self.model.parameters()
-                    if param.grad is not None
-                ]
-                gradient_norm = torch.cat(gradients).norm()
-                self.log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
-
-
-                batch_train_counter += 1
-
-            with torch.no_grad():
-                self.model.eval()
-                for image_batch in self.test_dataloader:
-
-                    x = self.apply_mean(
-                        image_batch.detach().clone(), self.mask_grid
-                    ).to(self.device)
-                    y = image_batch.to(self.device)
-
-                    prediction = self.model(x)
-                    loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
-
-                    loss = loss.cpu().detach().numpy()
-                    epoch_test_loss += loss
-                    self.log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
-                    batch_test_counter += 1
-
-            # Record training progress
-            epoch_train_loss /= train_steps  # Average over batches because there's a different number of batches
-            epoch_test_loss /= test_steps    # in the test and train parts
-            self.log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch_index)
-            self.log_writer.add_scalar("EpochLoss/test", epoch_test_loss, global_step=epoch_index)
-            self.plot_test_image(
-                test_image.cpu(), self.model(test_image).detach().cpu(), "EpochImage", epoch_index
-            )
-
-        self.model.to(torch.device('cpu'))
-        return
+        # # Constant device arrays
+        # mask_grid_dev = self.mask_grid.to(self.device)
+        # test_image = self.test_image[None, ...].to(self.device)
+        #
+        # criterion = MSELoss()
+        # # criterion = L1Loss()
+        # optimiser = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        #
+        # train_steps = int(self.train_frames / self.batch_size)
+        # test_steps = int(self.test_frames / self.batch_size)
+        #
+        # self.model.to(self.device)
+        # batch_train_counter, batch_test_counter = 0, 0
+        # for epoch_index in range(self.epochs):
+        #     print(f"Epoch {epoch_index:03d} of {self.epochs:03d}")
+        #     epoch_train_loss, epoch_test_loss = 0.0, 0.0
+        #     self.model.train()
+        #
+        #     # For each train batch
+        #     for image_batch in self.train_dataloader:
+        #
+        #         x = self.apply_mean(
+        #             image_batch.detach().clone(), self.mask_grid
+        #         ).to(self.device)  # Selectively mask a copy
+        #         y = image_batch.to(self.device)
+        #
+        #         prediction = self.model(x)
+        #         loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
+        #
+        #         optimiser.zero_grad()
+        #         loss.backward()
+        #         optimiser.step()
+        #
+        #         loss = loss.cpu().detach().numpy()
+        #         epoch_train_loss += loss
+        #         self.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
+        #
+        #         # Monitor convergence metrics
+        #         self.log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
+        #         self.log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
+        #         gradients = [
+        #             param.grad.detach().flatten()
+        #             for param in self.model.parameters()
+        #             if param.grad is not None
+        #         ]
+        #         gradient_norm = torch.cat(gradients).norm()
+        #         self.log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
+        #
+        #
+        #         batch_train_counter += 1
+        #
+        #     with torch.no_grad():
+        #         self.model.eval()
+        #         for image_batch in self.test_dataloader:
+        #
+        #             x = self.apply_mean(
+        #                 image_batch.detach().clone(), self.mask_grid
+        #             ).to(self.device)
+        #             y = image_batch.to(self.device)
+        #
+        #             prediction = self.model(x)
+        #             loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
+        #
+        #             loss = loss.cpu().detach().numpy()
+        #             epoch_test_loss += loss
+        #             self.log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
+        #             batch_test_counter += 1
+        #
+        #     # Record training progress
+        #     epoch_train_loss /= train_steps  # Average over batches because there's a different number of batches
+        #     epoch_test_loss /= test_steps    # in the test and train parts
+        #     self.log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch_index)
+        #     self.log_writer.add_scalar("EpochLoss/test", epoch_test_loss, global_step=epoch_index)
+        #     self.plot_test_image(
+        #         test_image.cpu(), self.model(test_image).detach().cpu(), "EpochImage", epoch_index
+        #     )
+        #
+        # self.model.to(torch.device('cpu'))
+        # return
 
     def plot_test_image(self, test_image: torch.Tensor, test_image_output: torch.Tensor, tag: str, epoch_index: int):
         """Plots a test image with tensorboard"""
@@ -248,7 +267,7 @@ class Trainer:
         return torch.from_numpy(void_image_batch(image_batch.numpy(), mask.numpy(), self.spacing))
 
     @staticmethod
-    def generate_grid(grid_shape: tuple[int, int], distance: int, jitter: int) -> torch.Tensor:
+    def generate_grid(grid_shape: tuple[int, int], distance: int, jitter: int) -> np.ndarray:
         """Generates an image masked in a grid-shape where mask-points are no closer than distance from themselves or
         the edges."""
 
@@ -274,52 +293,21 @@ class Trainer:
         jitter_grid = np.zeros_like(grid)
         jitter_grid[jitter_grid_coords[:, 0], jitter_grid_coords[:, 1]] = 1
         grid = jitter_grid
-
-        grid = torch.from_numpy(grid)
         return grid
 
-    def generate_dataloaders(
-        self, rank:int | None=None, world_size: int | None=None
-    ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, int, int]:
+    def split_datasets(self) -> tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
         """Randomly splits the dataset into test and train. Uses a distributed sampler if distributed. If so, rank and
-        world_size must be specified
-
-        Returns
-        -------
-        Tuple[DataLoader, DataLoader, int, int]
-            The Train and test dataloaders respectively, along with the number of frames in the train and test sets.
-        """
+        world_size must be specified"""
 
         train_set, test_set = torch.utils.data.random_split(
             self.dataset, (self.num_train_images, self.num_test_images)
         )
 
-        if self.distributed:
-            if rank is None or world_size is None:
-                raise ValueError("Rank and world size must be specified in a distributed context")
-            train_sampler = torch.utils.data.distributed.DistributedSampler(
-                train_set, rank=rank, num_replicas=world_size
-            )
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                test_set, rank=rank, num_replicas=world_size
-            )
-        else:
-            train_sampler, test_sampler = None, None
-
-        train_dataloader = torch.utils.data.DataLoader(
-            train_set, self.batch_size, shuffle=(train_sampler is None), sampler=train_sampler,
-            num_workers=min(12, self.batch_size)
-        )
-        test_dataloader = torch.utils.data.DataLoader(
-            test_set, self.batch_size, shuffle=(test_sampler is None), sampler=test_sampler,
-            num_workers=min(12, self.batch_size)
-        )
-
-        return train_dataloader, test_dataloader, len(train_set), len(test_set)
+        return train_set, test_set
 
 
 @nb.njit
-def void_image_batch(image_batch: np.ndarray, mask: np.ndarray, spacing: int) -> np.ndarray:
+def void_image_batch(image_batch: np.ndarray, mask: np.ndarray, void_size: int) -> np.ndarray:
     """Adds information voids to the image_batch at locations specified by match. Numba optimised."""
 
     mask_coords = np.argwhere(mask)
@@ -328,8 +316,8 @@ def void_image_batch(image_batch: np.ndarray, mask: np.ndarray, spacing: int) ->
         masked_pixels = image_batch[..., mask_coord[0], mask_coord[1]]
         locality = image_batch[  # Includes the receptive field's centre
             ...,
-            mask_coord[0] - spacing // 2: mask_coord[0] + spacing // 2,
-            mask_coord[1] - spacing // 2: mask_coord[1] + spacing // 2
+            mask_coord[0] - void_size // 2: mask_coord[0] + void_size // 2,
+            mask_coord[1] - void_size // 2: mask_coord[1] + void_size // 2
         ]
         local_sum = numba_sum_reduce(locality) - masked_pixels  # Receptive field excluding central pixel
         # num_locality is the number of pixels in a single image & channel of the batch, minus the central pixel
@@ -349,61 +337,246 @@ def numba_sum_reduce(arr: np.ndarray) -> np.ndarray:
     return res
 
 
-def _train_distributed_model(params: DistributedProcessConfig):
-    """Runs distributed training"""
+def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
+    """Trains a model using Distributed Data Parallel.
+
+    The model is duplicated across each rank/process in `world_size`. The batches are different in each rank. When the
+    model is updated after each training batch, the gradients and optimiser updates are synchronised across ranks.
+
+    This function should be run by each process/rank in the distributed process. They then synchronise with eachother.
+    """
+
+    assert params.world_size is not None
+
+    if rank == 0:
+        log_writer = SummaryWriter(log_dir=str(params.log_dir))
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12345"
-    torch.distributed.init_process_group("nccl", rank=params.rank)
-    torch.cuda.set_device(params.rank)
-    device = torch.device(f"cuda:{params.rank}")
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=params.world_size)
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
 
-    params.model.to(params.rank)
-    model = torch.nn.parallel.DistributedDataParallel(params.model, device_ids=[params.rank])
+    params.model.to(rank)
+    model = torch.nn.parallel.DistributedDataParallel(params.model, device_ids=[rank])
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        params.train_dataset, rank=rank, num_replicas=params.world_size, shuffle=True
+    )
+    test_sampler = torch.utils.data.distributed.DistributedSampler(
+        params.test_dataset, rank=rank, num_replicas=params.world_size, shuffle=True
+    )
+    train_dataloader = torch.utils.data.DataLoader(
+        params.train_dataset, params.batch_size, sampler=train_sampler, num_workers=4
+    )
+    test_dataloader = torch.utils.data.DataLoader(
+        params.test_dataset, params.batch_size, sampler=test_sampler, num_workers=4
+    )
 
     criterion = MSELoss()
     optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
     mask_grid_device = torch.from_numpy(params.mask_grid).to(device)  # A copy of the masking grid on GPU
+    validation_image = params.validation_image.to(device)
 
     batch_train_counter, batch_test_counter = 0, 0
 
     model.train()
     for epoch in range(params.epochs):
-        params.train_sampler.set_epoch(epoch)
-        params.test_sampler.set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
+        test_sampler.set_epoch(epoch)
         epoch_train_loss, epoch_test_loss = 0.0, 0.0
 
-        for image_batch in params.train_dataloader:
+        # Process a training batch
+        for image_batch in train_dataloader:
 
             # Selectively mask a copy of the image, on the CPU
-            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid)
+            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
             x = torch.from_numpy(x).to(device)  # Transfer to GPU
             y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
 
             prediction = model(x)
-            loss = criterion(prediction, y, mask_grid_device)
+            loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
 
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
 
-            # Logging, only done from rank 0
-            if params.rank == 0:
+            # Only perform logging and validation on rank 0
+            if rank == 0:
+
+                # Log the train loss
                 loss_value = loss.cpu().detach().numpy()
                 epoch_train_loss += loss_value
-                params.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
+                log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
 
                 # Monitor convergence metrics
-                params.log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
-                params.log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
+                log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
+                log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
                 gradients = [
                     param.grad.detach().flatten()
                     for param in params.model.parameters()
                     if param.grad is not None
                 ]
                 gradient_norm = torch.cat(gradients).norm()
-                params.log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
+                log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
 
+                batch_train_counter += params.world_size  # Batches are run on each rank in the world-size
+
+
+        if rank == 0:  # Process a test batch and epoch logging on rank zero only
+
+            # Test batch
+            params.model.eval()
+            for image_batch in test_dataloader:
+                x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
+                x = torch.from_numpy(x).to(device)  # Transfer to GPU
+                y = image_batch.to(device)
+
+                prediction = model(x)
+                loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
+
+                loss = loss.cpu().detach().numpy()
+                epoch_test_loss += loss
+                log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
+                batch_test_counter += 1
+            params.model.train()
+
+            # Epoch logging
+            # Normalise the cumulative losses for the different test/train sizes
+            epoch_train_loss /= len(train_dataloader)
+            epoch_test_loss /= len(test_dataloader)
+            log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch)
+            log_writer.add_scalar("EpochLoss/test", epoch_test_loss, global_step=epoch)
+            _plot_log_test_image(
+                log_writer, validation_image.cpu(), params.model(validation_image).detach().cpu(),
+                "EpochImage", epoch, params.px_scale, params.plot_dir
+            )
+
+    torch.distributed.destroy_process_group()
+
+
+def _train_model(params: _TrainingProcessConfig):
+    """Trains a model on a single GPU"""
+
+    assert params.world_size is None
+
+    log_writer = SummaryWriter(log_dir=str(params.log_dir))
+
+    device = torch.device("cuda")
+
+    # Constant device arrays
+    mask_grid_device = torch.from_numpy(params.mask_grid).to(device)
+    validation_image = params.validation_image.to(device)
+
+    criterion = MSELoss()
+    # criterion = L1Loss()
+    optimiser = torch.optim.Adam(params.model.parameters(), lr=params.learning_rate)
+
+    params.model.to(device)
+
+    train_dataloader = torch.utils.data.DataLoader(params.train_dataset, params.batch_size, shuffle=True)
+    test_dataloader = torch.utils.data.DataLoader(params.test_dataset, params.batch_size, shuffle=True)
+
+    batch_train_counter, batch_test_counter = 0, 0
+    params.model.train()
+    for epoch in range(params.epochs):
+        epoch_train_loss, epoch_test_loss = 0.0, 0.0
+
+        # For each train batch
+        for image_batch in train_dataloader:
+
+            # Selectively mask a copy of the image, on the CPU
+            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
+            x = torch.from_numpy(x).to(device)  # Transfer to GPU
+            y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
+
+            prediction = params.model(x)
+            loss = criterion(prediction, y, mask_grid_device) / len(image_batch)  # Norm over non-uniform batch length
+
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+
+            loss = loss.cpu().detach().numpy()
+            epoch_train_loss += loss
+            log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
+
+            # Monitor convergence metrics
+            log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
+            log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
+            gradients = [
+                param.grad.detach().flatten()
+                for param in params.model.parameters()
+                if param.grad is not None
+            ]
+            gradient_norm = torch.cat(gradients).norm()
+            log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
+
+
+            batch_train_counter += 1
+
+        # Run a test batch
+        params.model.eval()
+        for image_batch in test_dataloader:
+
+            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
+            x = torch.from_numpy(x).to(device)
+            y = image_batch.to(device)
+
+            prediction = params.model(x)
+            loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
+
+            loss = loss.cpu().detach().numpy()
+            epoch_test_loss += loss
+            log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
+            batch_test_counter += 1
+        params.model.train()
+
+        # Record training progress
+        epoch_train_loss /= len(train_dataloader)  # Norm over batches as test & train different length
+        epoch_test_loss /= len(test_dataloader)
+        log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch)
+        log_writer.add_scalar("EpochLoss/test", epoch_test_loss, global_step=epoch)
+        _plot_log_test_image(
+            log_writer, params.validation_image, params.model(validation_image).detach().cpu(),
+            "EpochImage", epoch, params.px_scale, params.plot_dir
+        )
+
+    return
+
+
+def _plot_log_test_image(
+    log_writer: SummaryWriter, test_image: torch.Tensor, test_image_output: torch.Tensor, tag: str,
+    epoch_index: int, px_scale: float | None, plot_savedir: pathlib.Path
+):
+    """Plots a test image with tensorboard"""
+
+    assert len(test_image.shape) == 4 and test_image.shape[0] == 1
+    chans = test_image.shape[1]
+    if chans == 1:
+        im = ((test_image_output[0, 0] + 1.0) * 128.).to(torch.uint8)
+        log_writer.add_image(tag, im, dataformats="HW", global_step=epoch_index)
+    else:
+        im = ((test_image_output[0] + 1.0) * 128.).to(torch.uint8)
+        log_writer.add_images(tag, im, dataformats="CHW", global_step=epoch_index)
+
+    gridspec_kw = dict(left=0, right=1, bottom=0, top=1, wspace=0, hspace=0)
+    if chans == 1:  # If only one channel, plot side-by-side
+        fig, axes = plt.subplots(chans, 2, gridspec_kw=gridspec_kw, figsize=(16, 8), squeeze=False)
+        axes = axes.T  # Swap axes to confirm with the multi-channel layout in code
+    else:  # Otherwise, channels are side-by-side and noisy/denoised is above/below
+        fig, axes = plt.subplots(2, chans, gridspec_kw=gridspec_kw, figsize=(chans * 8, 16))
+    for row_index, im in enumerate((test_image, test_image_output)):
+        for chan_index in range(chans):
+            axes[row_index, chan_index].imshow(
+                im[0, chan_index], cmap="inferno", interpolation=None, vmin=-1, vmax=1
+            )
+            axes[row_index, chan_index].axis("off")
+    if px_scale is not None:
+        sbar = ScaleBar(px_scale, "nm", location="lower right", color='w', box_color='k', box_alpha=0.7)
+        axes[-1, -1].add_artist(sbar)
+    fig.savefig(plot_savedir / f"epoch_{epoch_index:03d}.png")
+    plt.close(fig)
 
 
 class MSELoss(torch.nn.Module):

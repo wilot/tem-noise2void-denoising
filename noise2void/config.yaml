@@ -1,23 +1,23 @@
 # Noise2Void training run parameters
 
 # These are used in various places
-run_directory: "runs/WS2/run_{index}"  # {index} is replaced with the next integer if necessary
+run_directory: "runs/IrGLC/run_{index}"  # {index} is replaced with the next integer if necessary
 image_size: 512
-channels: ["HAADF", "BF"]
+channels: ["HAADF",]
 
 model:  # Used to define the model
   name: "UNet"
   depth: 4
-  first_layer_channels: 32
+  first_layer_channels: 64
   initial_kernel_size: 5
   state_savename: "model_state.pt"    # Where to save the raw weights
   traced_savename: "traced_model.pt"  # Where to save the JIT/traced ScriptModule
 
 trainer:
   learning_rate: 2e-5  # Adam optimiser learning rate
-  batch_size: 16
-  epochs: 196
-  spacing: 28
+  batch_size: 7
+  epochs: 32
+  spacing: 24
   test_fraction: 0.2
 
 dataset:
@@ -32,5 +32,5 @@ dataset:
 
 # Logging config
 defaults:
-  - hydra/hydra_logging: none
-  - hydra/job_logging: none
+  - override hydra/hydra_logging: none
+  - override hydra/job_logging: none

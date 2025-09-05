@@ -107,7 +107,7 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
     def reserved_example(self) -> torch.Tensor:
         """A cropped and normalised example held back from the training set for validations."""
 
-        datum = self.video_stack[self._reserved_example_index]
+        datum = self.video_stack[self._reserved_example_index][None, ...]  # Shape [1, channels, H, W]
         return datum
 
     @classmethod

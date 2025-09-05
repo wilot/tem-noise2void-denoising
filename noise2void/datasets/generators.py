@@ -26,5 +26,5 @@ def _generate_iridium_video_from_config(config) -> IridiumVideoDataset:
 # A mapping from the string specified in every config file's dataset section to a method to generate it from that config
 dataset_generators = {
     "WS2": _generate_tungsten_from_config,
-    "IrGLCVideo": _generate_iridium_video_from_config,
+    "IridiumGLCVideo": _generate_iridium_video_from_config,
 }

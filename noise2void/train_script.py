@@ -14,11 +14,10 @@ from omegaconf import DictConfig
 
 from noise2void.datasets.generators import dataset_generators
 from noise2void.models.generators import model_generators
-from noise2void.datasets.tungsten_dataset import TungstenDataset
+from noise2void.datasets.channels import MultiChannelDataset
 from noise2void.trainer import Trainer, TrainConfig
-from noise2void.models import UNet
+from noise2void.models.unet import UNet
 
-assert __name__ == '__main__'  # Don't import this!
 
 PROJECT_DIR = Path(__file__).parents[1]
 
@@ -72,20 +71,25 @@ def main(config: DictConfig):
         print(f"Model not recognized: {config.model.name}")
         sys.exit(2)
     model = model_generators[config.model.name](config)
+    print("Defined model")
 
     if config.dataset.type not in dataset_generators:
         print(f"Dataset not recognized: {config.dataset.type}")
         sys.exit(2)
-    dataset: TungstenDataset = dataset_generators[config.dataset.type](config)
+    dataset: MultiChannelDataset = dataset_generators[config.dataset.type](config)
+    print("Initialised dataset, commencing training")
 
     train_config = TrainConfig(
         **config.trainer, log_dir=run_path / "training_log", image_shape=config.image_size,
         px_scale=config.dataset.px_scale
     )
-    trainer = Trainer(dataset, model, dataset.reserved_example, train_config)
-    trainer.train_model()
+    trainer = Trainer(dataset, model, True, dataset.reserved_example, train_config)
+    trainer.train_distributed_model()
+    print("Training complete, saving")
 
     save_trace_model(model, dataset.reserved_example, run_path, config.model)
+
+    print("Complete")
 
 
 if __name__ == "__main__":
