@@ -57,7 +57,9 @@ def save_trace_model(model: UNet, example_datum: torch.Tensor, savedir: Path, mo
     """Saves the state-dict and then JIT traces/compiles the model with the example tensor."""
 
     torch.save(model.state_dict(), savedir / model_config.state_savename)
-    traced_model: torch.jit.ScriptModule = torch.jit.trace(model, example_datum[None, ...])
+    model.eval()
+    model = model.to(torch.device("cpu"))
+    traced_model: torch.jit.ScriptModule = torch.jit.trace(model, example_datum)
     traced_model.save(savedir / model_config.traced_savename)
 
 
@@ -76,8 +78,8 @@ def main(config: DictConfig):
     if config.dataset.type not in dataset_generators:
         print(f"Dataset not recognized: {config.dataset.type}")
         sys.exit(2)
-    dataset: MultiChannelDataset = dataset_generators[config.dataset.type](config)
-    print("Initialised dataset, commencing training")
+    dataset: MultiChannelDataset = dataset_generators[config.dataset.type](config, predict=False)
+    print(f"Initialised dataset with length {len(dataset)}, commencing training")
 
     train_config = TrainConfig(
         **config.trainer, log_dir=run_path / "training_log", image_shape=config.image_size,

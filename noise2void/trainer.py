@@ -13,7 +13,6 @@ Trains the UNets with Noise2Void training regime.
 * void_image_batch - Adds void pixels to an image according to the Noise2Void technique. CPU optimised
 * void_image_batch_tensor - As above but on the GPU. Slower but easier to read so I haven't deleted it yet.
 * numba_sum_reduce - Optimised sum-reduction
-
 """
 
 import os
@@ -35,6 +34,9 @@ from matplotlib_scalebar.scalebar import ScaleBar
 from noise2void.models.unet import UNet
 
 CPU = torch.device('cpu')
+# This is used to transfer weights from distributed context back to the main process after distributed training has
+# finished.
+TEMP_FILENAME = "final_model_state.pt"
 
 
 @dataclass
@@ -58,8 +60,9 @@ class _TrainingProcessConfig:
     model: torch.nn.Module
     train_dataset: torch.utils.data.Dataset
     test_dataset: torch.utils.data.Dataset
-    mask_grid: np.ndarray
+    image_size: int  # The size of each image in the batch in H, W
     validation_image: torch.Tensor
+    void_spacing: int
     void_size: int
     learning_rate: float
     batch_size: int
@@ -103,6 +106,7 @@ class Trainer:
         self.px_scale = config.px_scale
         self.test_image = test_image
         self.distributed = distributed
+        self.image_size = config.image_shape
         self.log_dir = config.log_dir
         self.plot_savedir = pathlib.Path(config.log_dir) / "epoch_plots"
         self.plot_savedir.mkdir(parents=True, exist_ok=False)
@@ -116,8 +120,8 @@ class Trainer:
         self.train_dataset, self.test_dataset = self.split_datasets()
 
         self.cpu_workers = max(1, min(self.batch_size, 40))
-        self.mask_grid = self.generate_grid((config.image_shape, config.image_shape), config.spacing, 2)
-        self.void_size = config.spacing - 2  # The area contributing information to each void/averaged pixel
+        self.void_spacing = config.spacing
+        self.void_size = config.spacing - 8  # Jitter up to 8px
 
     def train_distributed_model(self):
         """Trains the model across several GPUs"""
@@ -125,15 +129,18 @@ class Trainer:
         num_devices = torch.cuda.device_count()
         train_params = _TrainingProcessConfig(
             model=self.model, train_dataset=self.train_dataset, test_dataset=self.test_dataset,
-            mask_grid=self.mask_grid, validation_image=self.test_image, learning_rate=self.learning_rate,
+            image_size=self.image_size, validation_image=self.test_image, learning_rate=self.learning_rate,
             batch_size=self.batch_size, epochs=self.epochs, world_size=num_devices, void_size=self.void_size,
-            log_dir=self.log_dir, plot_dir=self.plot_savedir, px_scale=self.px_scale
+            void_spacing=self.void_spacing, log_dir=self.log_dir, plot_dir=self.plot_savedir, px_scale=self.px_scale
         )
         mp.spawn(
             _train_distributed_model,
             args=(train_params,), nprocs=num_devices, join=True
         )  # Waits until all processes rejoin/end
         self.model.to(CPU)
+        # Load the final weights that were saved by rank 0 (i.e. GPU 0), transfer them to CPU
+        self.model.load_state_dict(torch.load(self.log_dir / TEMP_FILENAME, map_location={"cuda:0": "cpu"}))
+        (self.log_dir / TEMP_FILENAME).unlink()  # Delete the temporary file
 
     def train_model(self):
         """Train the model!
@@ -143,92 +150,12 @@ class Trainer:
 
         train_params = _TrainingProcessConfig(
             model=self.model, train_dataset=self.train_dataset, test_dataset=self.test_dataset,
-            mask_grid=self.mask_grid, validation_image=self.test_image, batch_size=self.batch_size,
+            image_size=self.image_size, validation_image=self.test_image, batch_size=self.batch_size,
             learning_rate=self.learning_rate, epochs=self.epochs, world_size=None, void_size=self.void_size,
-            log_dir=self.log_dir, plot_dir=self.plot_savedir, px_scale=self.px_scale
+            void_spacing=self.void_spacing, log_dir=self.log_dir, plot_dir=self.plot_savedir, px_scale=self.px_scale
         )
         _train_model(train_params)
         self.model.to(CPU)
-
-        # # Constant device arrays
-        # mask_grid_dev = self.mask_grid.to(self.device)
-        # test_image = self.test_image[None, ...].to(self.device)
-        #
-        # criterion = MSELoss()
-        # # criterion = L1Loss()
-        # optimiser = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        #
-        # train_steps = int(self.train_frames / self.batch_size)
-        # test_steps = int(self.test_frames / self.batch_size)
-        #
-        # self.model.to(self.device)
-        # batch_train_counter, batch_test_counter = 0, 0
-        # for epoch_index in range(self.epochs):
-        #     print(f"Epoch {epoch_index:03d} of {self.epochs:03d}")
-        #     epoch_train_loss, epoch_test_loss = 0.0, 0.0
-        #     self.model.train()
-        #
-        #     # For each train batch
-        #     for image_batch in self.train_dataloader:
-        #
-        #         x = self.apply_mean(
-        #             image_batch.detach().clone(), self.mask_grid
-        #         ).to(self.device)  # Selectively mask a copy
-        #         y = image_batch.to(self.device)
-        #
-        #         prediction = self.model(x)
-        #         loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
-        #
-        #         optimiser.zero_grad()
-        #         loss.backward()
-        #         optimiser.step()
-        #
-        #         loss = loss.cpu().detach().numpy()
-        #         epoch_train_loss += loss
-        #         self.log_writer.add_scalar("BatchLoss/train", loss, global_step=batch_train_counter)
-        #
-        #         # Monitor convergence metrics
-        #         self.log_writer.add_scalar("BatchStats/mean", torch.mean(prediction), global_step=batch_train_counter)
-        #         self.log_writer.add_scalar("BatchStats/std", torch.std(prediction), global_step=batch_train_counter)
-        #         gradients = [
-        #             param.grad.detach().flatten()
-        #             for param in self.model.parameters()
-        #             if param.grad is not None
-        #         ]
-        #         gradient_norm = torch.cat(gradients).norm()
-        #         self.log_writer.add_scalar("BatchStats/gradnorm", gradient_norm, global_step=batch_train_counter)
-        #
-        #
-        #         batch_train_counter += 1
-        #
-        #     with torch.no_grad():
-        #         self.model.eval()
-        #         for image_batch in self.test_dataloader:
-        #
-        #             x = self.apply_mean(
-        #                 image_batch.detach().clone(), self.mask_grid
-        #             ).to(self.device)
-        #             y = image_batch.to(self.device)
-        #
-        #             prediction = self.model(x)
-        #             loss = criterion(prediction, y, mask_grid_dev) / len(image_batch)
-        #
-        #             loss = loss.cpu().detach().numpy()
-        #             epoch_test_loss += loss
-        #             self.log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
-        #             batch_test_counter += 1
-        #
-        #     # Record training progress
-        #     epoch_train_loss /= train_steps  # Average over batches because there's a different number of batches
-        #     epoch_test_loss /= test_steps    # in the test and train parts
-        #     self.log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch_index)
-        #     self.log_writer.add_scalar("EpochLoss/test", epoch_test_loss, global_step=epoch_index)
-        #     self.plot_test_image(
-        #         test_image.cpu(), self.model(test_image).detach().cpu(), "EpochImage", epoch_index
-        #     )
-        #
-        # self.model.to(torch.device('cpu'))
-        # return
 
     def plot_test_image(self, test_image: torch.Tensor, test_image_output: torch.Tensor, tag: str, epoch_index: int):
         """Plots a test image with tensorboard"""
@@ -266,35 +193,6 @@ class Trainer:
         assert image_batch.device == CPU and mask.device == CPU  # This is an absolute pig if not caught early!
         return torch.from_numpy(void_image_batch(image_batch.numpy(), mask.numpy(), self.spacing))
 
-    @staticmethod
-    def generate_grid(grid_shape: tuple[int, int], distance: int, jitter: int) -> np.ndarray:
-        """Generates an image masked in a grid-shape where mask-points are no closer than distance from themselves or
-        the edges."""
-
-        max_jitter = jitter  # Jitter the regular grid of hot pixels by up to
-        distance += max_jitter  # Preserve minimum distance even after jittering
-
-        y_grid, x_grid = np.meshgrid(np.arange(grid_shape[0]), np.arange(grid_shape[1]))
-        border = np.logical_or(
-            np.logical_or(y_grid < distance, y_grid > grid_shape[0] - distance),
-            np.logical_or(x_grid < distance, x_grid > grid_shape[1] - distance)
-        )
-        v_stripes = y_grid % distance == 0
-        h_stripes = x_grid % distance == 0
-        grid = np.logical_and(  # This is now a regular grid of pixels spaced out by receptive field.
-            np.logical_and(v_stripes, h_stripes),
-            np.logical_not(border)
-        )
-
-        # Add random displacements for each gridpoint to prevent grid artifacts in final result.
-        grid_coords = np.argwhere(grid)
-        jitter_grid_coords = grid_coords + \
-            np.random.default_rng().integers(low=-max_jitter, high=max_jitter, size=grid_coords.shape)
-        jitter_grid = np.zeros_like(grid)
-        jitter_grid[jitter_grid_coords[:, 0], jitter_grid_coords[:, 1]] = 1
-        grid = jitter_grid
-        return grid
-
     def split_datasets(self) -> tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
         """Randomly splits the dataset into test and train. Uses a distributed sampler if distributed. If so, rank and
         world_size must be specified"""
@@ -306,9 +204,39 @@ class Trainer:
         return train_set, test_set
 
 
+def generate_grid(grid_shape: tuple[int, int], distance: int, jitter: int) -> np.ndarray:
+    """Generates an image masked in a grid-shape where mask-points are no closer than distance from themselves or
+    the edges."""
+
+    max_jitter = jitter  # Jitter the regular grid of hot pixels by up to
+    distance += max_jitter  # Preserve minimum distance even after jittering
+
+    y_grid, x_grid = np.meshgrid(np.arange(grid_shape[0]), np.arange(grid_shape[1]))
+    border = np.logical_or(
+        np.logical_or(y_grid < distance, y_grid > grid_shape[0] - distance),
+        np.logical_or(x_grid < distance, x_grid > grid_shape[1] - distance)
+    )
+    v_stripes = y_grid % distance == 0
+    h_stripes = x_grid % distance == 0
+    grid = np.logical_and(  # This is now a regular grid of pixels spaced out by receptive field.
+        np.logical_and(v_stripes, h_stripes),
+        np.logical_not(border)
+    )
+
+    # Add random displacements for each gridpoint to prevent grid artifacts in final result.
+    grid_coords = np.argwhere(grid)
+    jitter_grid_coords = grid_coords + \
+        np.random.default_rng().integers(low=-max_jitter, high=max_jitter, size=grid_coords.shape)
+    jitter_grid = np.zeros_like(grid)
+    jitter_grid[jitter_grid_coords[:, 0], jitter_grid_coords[:, 1]] = 1
+    grid = jitter_grid
+    return grid
+
+
 @nb.njit
-def void_image_batch(image_batch: np.ndarray, mask: np.ndarray, void_size: int) -> np.ndarray:
-    """Adds information voids to the image_batch at locations specified by match. Numba optimised."""
+def void_image_batch(image_batch: np.ndarray, mask: np.ndarray, void_size: int):
+    """Adds information voids to the image_batch at locations specified by match. Numba optimised, operates in-place.
+    The image_batch MUST be of floating point type."""
 
     mask_coords = np.argwhere(mask)
     for mask_coord_index in nb.prange(len(mask_coords)):  # RACE CONDITION IF RECEPTIVE FIELD IS WRONG!!!
@@ -350,6 +278,7 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
 
     if rank == 0:
         log_writer = SummaryWriter(log_dir=str(params.log_dir))
+        batch_train_counter, batch_test_counter = 0, 0
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12345"
@@ -367,32 +296,33 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
         params.test_dataset, rank=rank, num_replicas=params.world_size, shuffle=True
     )
     train_dataloader = torch.utils.data.DataLoader(
-        params.train_dataset, params.batch_size, sampler=train_sampler, num_workers=4
+        params.train_dataset, params.batch_size, sampler=train_sampler,
     )
     test_dataloader = torch.utils.data.DataLoader(
-        params.test_dataset, params.batch_size, sampler=test_sampler, num_workers=4
+        params.test_dataset, params.batch_size, sampler=test_sampler,
     )
 
-    criterion = MSELoss()
+    # criterion = MSELoss()
+    criterion = L1Loss()
     optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
-    mask_grid_device = torch.from_numpy(params.mask_grid).to(device)  # A copy of the masking grid on GPU
     validation_image = params.validation_image.to(device)
 
-    batch_train_counter, batch_test_counter = 0, 0
-
-    model.train()
     for epoch in range(params.epochs):
+        model.train()
         train_sampler.set_epoch(epoch)
         test_sampler.set_epoch(epoch)
         epoch_train_loss, epoch_test_loss = 0.0, 0.0
+
+        mask_grid = generate_grid((params.image_size, params.image_size), params.void_spacing, 8)
+        mask_grid_device = torch.from_numpy(mask_grid).to(device)
 
         # Process a training batch
         for image_batch in train_dataloader:
 
             # Selectively mask a copy of the image, on the CPU
-            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
+            x = void_image_batch(image_batch.clone().numpy(), mask_grid, params.void_size)
             x = torch.from_numpy(x).to(device)  # Transfer to GPU
-            y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
+            y = image_batch[:, 0][:, None, ...].to(device)  # Transfer the original to the GPU too (as the target)
 
             prediction = model(x)
             loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
@@ -422,27 +352,30 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
 
                 batch_train_counter += params.world_size  # Batches are run on each rank in the world-size
 
+            torch.distributed.barrier()  # All ranks to wait for logging to complete before proceeding
 
-        if rank == 0:  # Process a test batch and epoch logging on rank zero only
+        # Test mode
+        model.eval()
+        for image_batch in test_dataloader:  # Process the test dataset
+            x = void_image_batch(image_batch.clone().numpy(), mask_grid, params.void_size)
+            x = torch.from_numpy(x).to(device)  # Transfer to GPU
+            y = image_batch.to(device)
 
-            # Test batch
-            params.model.eval()
-            for image_batch in test_dataloader:
-                x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
-                x = torch.from_numpy(x).to(device)  # Transfer to GPU
-                y = image_batch.to(device)
+            prediction = model(x)
+            loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
 
-                prediction = model(x)
-                loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
+            # Loss is computed over each rank/process/gpu
+            # Average across all and send it to rank 0
+            torch.distributed.reduce(loss, dst=0, op=torch.distributed.ReduceOp.AVG)
 
+            if rank == 0:  # Only write to the logger from one of the ranks
                 loss = loss.cpu().detach().numpy()
                 epoch_test_loss += loss
                 log_writer.add_scalar("BatchLoss/test", loss, global_step=batch_test_counter)
-                batch_test_counter += 1
-            params.model.train()
+                batch_test_counter += params.world_size
+            torch.distributed.barrier()  # Have every rank wait for this logging to get done before continuing
 
-            # Epoch logging
-            # Normalise the cumulative losses for the different test/train sizes
+        if rank == 0:  # At the end of the epoch, log the epoch losses
             epoch_train_loss /= len(train_dataloader)
             epoch_test_loss /= len(test_dataloader)
             log_writer.add_scalar("EpochLoss/train", epoch_train_loss, global_step=epoch)
@@ -451,7 +384,11 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
                 log_writer, validation_image.cpu(), params.model(validation_image).detach().cpu(),
                 "EpochImage", epoch, params.px_scale, params.plot_dir
             )
+        torch.distributed.barrier()  # Make all workers/processes wait for the test step to complete
 
+    if rank == 0:  # Save the model's final weights temporarily, as a way of sending it to the main process
+        torch.save(model.module.state_dict(), params.log_dir / TEMP_FILENAME)
+    torch.distributed.barrier()
     torch.distributed.destroy_process_group()
 
 
@@ -465,7 +402,6 @@ def _train_model(params: _TrainingProcessConfig):
     device = torch.device("cuda")
 
     # Constant device arrays
-    mask_grid_device = torch.from_numpy(params.mask_grid).to(device)
     validation_image = params.validation_image.to(device)
 
     criterion = MSELoss()
@@ -482,13 +418,16 @@ def _train_model(params: _TrainingProcessConfig):
     for epoch in range(params.epochs):
         epoch_train_loss, epoch_test_loss = 0.0, 0.0
 
+        mask_grid = generate_grid((params.image_size, params.image_size), params.void_spacing, 8)
+        mask_grid_device = torch.from_numpy(mask_grid).to(device)
+
         # For each train batch
         for image_batch in train_dataloader:
 
             # Selectively mask a copy of the image, on the CPU
-            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
+            x = void_image_batch(image_batch.clone().numpy(), mask_grid, params.void_size)
             x = torch.from_numpy(x).to(device)  # Transfer to GPU
-            y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
+            y = image_batch[:, 0][:, None, ...].to(device)  # Transfer the original to the GPU too (as the target)
 
             prediction = params.model(x)
             loss = criterion(prediction, y, mask_grid_device) / len(image_batch)  # Norm over non-uniform batch length
@@ -519,7 +458,7 @@ def _train_model(params: _TrainingProcessConfig):
         params.model.eval()
         for image_batch in test_dataloader:
 
-            x = void_image_batch(image_batch.clone().numpy(), params.mask_grid, params.void_size)
+            x = void_image_batch(image_batch.clone().numpy(), mask_grid, params.void_size)
             x = torch.from_numpy(x).to(device)
             y = image_batch.to(device)
 
@@ -552,7 +491,7 @@ def _plot_log_test_image(
     """Plots a test image with tensorboard"""
 
     assert len(test_image.shape) == 4 and test_image.shape[0] == 1
-    chans = test_image.shape[1]
+    chans = test_image.shape[1]  # Stack of three latest frames for each channel
     if chans == 1:
         im = ((test_image_output[0, 0] + 1.0) * 128.).to(torch.uint8)
         log_writer.add_image(tag, im, dataformats="HW", global_step=epoch_index)
@@ -580,7 +519,7 @@ def _plot_log_test_image(
 
 
 class MSELoss(torch.nn.Module):
-    """A MSE loss for Noise2Void architetures, requiring a prediction, target and mask-grid."""
+    """A MSE loss for Noise2Void architectures, requiring a prediction, target and mask-grid."""
 
     def __init__(self):
         super(MSELoss, self).__init__()
@@ -605,3 +544,35 @@ class L1Loss(torch.nn.Module):
         masked_abs_error = abs_error * mask_broadcast
         masked_l1_loss = masked_abs_error.sum() / mask.sum()
         return masked_l1_loss
+
+
+if __name__ == "__main__":
+
+    import skimage.data
+    import matplotlib.pyplot as plt
+    from noise2void.datasets.iridium_glc_dataset import IridiumVideoDataset
+
+    # Test the voiding functionality
+    mask_grid = Trainer.generate_grid((256, 256), 24, 8)
+    test_image = skimage.data.brick()[None, None, :256, :256].astype(np.float32)
+    void_image = void_image_batch(test_image.copy(), mask_grid, 32 - 8)
+    fig, axes = plt.subplots(1, 3, sharex=True, sharey=True, figsize=(24, 8))
+    axes[0].imshow(mask_grid, cmap="Greys_r")
+    axes[1].imshow(test_image[0, 0], cmap="Greys_r")
+    axes[2].imshow(void_image[0, 0], cmap="Greys_r")
+    axes[0].set_title("Mask grid")
+    axes[1].set_title("Test image")
+    axes[2].set_title("Void image")
+
+    print("Now attempting real example")
+    dset = IridiumVideoDataset(256, 0, ["HAADF Image_movie_0231a_817.dm4"])
+    fig, axes = plt.subplots(2, 4, sharex=True, sharey=True, figsize=(24, 8))
+    axes[0, 0].imshow(mask_grid, cmap="Greys_r")
+    axes[1, 0].imshow(mask_grid, cmap="Greys_r")
+    for ax_index in (0, 1):
+        im = dset[ax_index][None, ...]
+        void_image = void_image_batch(im.clone().numpy(), mask_grid, 24 - 8)
+        axes[ax_index, 1].imshow(im[0, 0], cmap="Greys_r")
+        axes[ax_index, 2].imshow(void_image[0, 0], cmap="Greys_r")
+        axes[ax_index, 3].imshow(im[0, 0] - void_image[0, 0], cmap="Greys_r")
+    plt.show(block=True)

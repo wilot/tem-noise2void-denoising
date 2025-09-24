@@ -29,9 +29,19 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
     BLACKLIST_FILE = Path("noise2void/datasets/iridium_glc_blacklist.toml")
     VIDEO_PLOT_FPS = 10
 
-    def __init__(self, image_size: int, example_index: int | None=None):
+    def __init__(self, image_size: int, example_index: int | None=None, video_filter: list[str] | None=None):
+        """
+        Parameters
+        ----------
+        image_size: int
+            The size of the frames to be outputted. Should be either 512px or 256px. Videos will be tiled to match
+        example_index: int | None
+            The index of the example frame to hold back. If None, this will be chosen randomly
+        video_filter: list[str] | None
+            If supplied, only videos whose filename is within this list will be included in the dataset
+        """
 
-        assert image_size <= 512
+        assert image_size == 512 or image_size == 256
         self.image_size = image_size
         self._channels = Channel.HAADF
 
@@ -45,7 +55,12 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
         self._valid_filegroups = list(filter(
             lambda meta: self.blacklist["videos"][meta.index] is not False, self._all_filegroups
         ))
-        for meta in self._valid_filegroups:
+        if video_filter is not None:
+            print("Applying supplied video filter list")
+            self._valid_filegroups = list(filter(  # Only include data if filename is within the `video_filter`
+                lambda meta: meta.fpaths[Channel.HAADF].name in video_filter, self._valid_filegroups
+            ))
+        for meta in tqdm(self._valid_filegroups, desc="Reading metadata from Iridium videos"):
             meta.fetch_scale_shape()  # The scale metadata is wrong, but the shape is useful!
             if meta.shape != 512 and meta.shape != 1024:  # They're all this
                 raise ValueError(f"Video: {meta.fpaths[Channel.HAADF]} has unexpected shape {meta.shape}")
@@ -53,26 +68,21 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
             meta.frames = sum(stop - start for start, stop in self.blacklist["videos"][meta.index])  # Count ok frames
         self._sample_filegroups = self._valid_filegroups
 
-        # Calculate the length of the total dataset
-        self._len = sum(  # They're all 512 or 1024 px videos
-            meta.frames if meta.shape == 512 else meta.frames * 4
-            for meta in self.sample_filegroups
-        )
+        self._video_stack = self._create_compressed_dataset(return_array=True)
+        self._len = self._video_stack.shape[0]
+
         if example_index is None:
-            self._reserved_example_index = int(torch.randint(0, self._len, (1,))[0])
+            self._reserved_example_index = int(torch.randint(2, self._len, (1,))[0])
         else:
             self._reserved_example_index = example_index
         self._len -= 1  # Hold the reserved example back!
-        if not self.VIDEO_STACK_PATH.exists():
-            self._create_compressed_dataset()
-        self._video_stack: torch.Tensor | None = None
 
     @property
     def sample_filegroups(self) -> list[MultiChannelMetadata]:
         return self._sample_filegroups
 
     def load_interpolate(self, meta: MultiChannelMetadata) -> torch.Tensor:
-        """Loads the image/video and interpolates to required scale"""
+        """Loads the image/video and interpolates to required scale. Does not do any H, W cropping"""
 
         datum = torch.from_numpy(meta.load_channels(self.channels)).to(torch.float32)
 
@@ -94,7 +104,7 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
 
         datum -= torch.mean(datum, dim=(-2, -1), keepdim=True)
         datum /= torch.std(datum, dim=(-2, -1), keepdim=True) * 5
-        datum = torch.tanh(datum)
+        # datum = torch.tanh(datum)
         return datum
 
     @property
@@ -122,7 +132,11 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
         """A cache of all the pre-normalised, cropped/tiled video frames"""
 
         if self._video_stack is None:
-            self._video_stack = torch.load(self.VIDEO_STACK_PATH)
+            saved_video = torch.load(self.VIDEO_STACK_PATH)
+            if saved_video.shape[-1] == self.image_size:
+                self._video_stack = saved_video
+            else:
+                self._video_stack = self._create_compressed_dataset(return_array=True)
         return self._video_stack
 
     def __len__(self):
@@ -134,16 +148,21 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
             index += 1  # Skip the reserved example!
         return self.video_stack[index]
 
-    def _create_compressed_dataset(self):
+    def _create_compressed_dataset(self, return_array: bool=False) -> torch.Tensor | None:
         """Saves all the videos into a single HDF5 for much faster loading.
 
         I can dave this all into one massive file and load it into ram, but this would crash most PCs!
         """
 
+        assert self.image_size == 512 or self.image_size == 256
+
         video_stack = list()
         for meta in self.sample_filegroups:
             video = self.load_interpolate(meta)
-            if video.shape[-1] == 1024:  # They're all 1K or 512px
+            video = self.normalise(video)  # Normalise frame-wise
+            if torch.any(torch.isnan(video)):
+                raise ValueError(f"WARNING: NaNs found in normalised video from {meta.fpaths[Channel.HAADF]}")
+            if video.shape[-1] == 1024:  # They're all 1K or 512px, most are 512px
                 video_stack.append(video[..., :512, :512])  # Upper left
                 video_stack.append(video[..., :512, 512:])  # Upper right
                 video_stack.append(video[..., 512:, :512])  # Lower left
@@ -152,8 +171,18 @@ class IridiumVideoDataset(Dataset, MultiChannelDataset):
                 video_stack.append(video)
         # The big array
         video_stack = torch.concat(video_stack)
-        video_stack = self.normalise(video_stack)
+
+        # Now fold the stack to 256px if necessary
+        if self.image_size == 256:
+            unfold = video_stack.unfold(2, 256, 256).unfold(3, 256, 256)
+            unfold = torch.permute(unfold, (0, 2, 3, 1, 4, 5)).contiguous().view((-1, video_stack.shape[1], 256, 256))
+            video_stack = unfold
+            self._len = video_stack.shape[0] - 1
         torch.save(video_stack, self.VIDEO_STACK_PATH)
+        if return_array:
+            return video_stack
+        else:
+            return None
 
     def _plot(self):
         """Plot a visual representation of every item in the dataset"""
@@ -294,9 +323,9 @@ class IridiumImageDataset(Dataset, MultiChannelDataset):
     def normalise(datum: torch.Tensor) -> torch.Tensor:
         """Normalises an image or video"""
 
-        datum -= torch.mean(datum, dim=(-2, -1), keepdim=True)
+        datum -= torch.amin(datum, dim=(-2, -1), keepdim=True)
         datum /= torch.std(datum, dim=(-2, -1), keepdim=True) * 5
-        datum = torch.tanh(datum)
+        # datum = torch.tanh(datum)
         return datum
 
     @property
@@ -480,15 +509,43 @@ def _try_insert_filepath(
 if __name__ == "__main__":
     # For getting info on the samples and plotting etc.
 
-    dset = IridiumVideoDataset(512)
+    dset = IridiumVideoDataset(512, 0, ["HAADF Image_movie_0231a_817.dm4"])
     print(f"There are {len(dset)} frames")
     print(f"{dset.video_stack.shape=}")
 
-    # Plot some examples
-    fig, axes = plt.subplots(2, 4)
-    for ax in axes.flatten():
-        rand_index = int(torch.randint(0, len(dset), (1,))[0])
-        frame = dset[rand_index]
-        ax.imshow(frame[0], cmap="inferno")
-        ax.axis("off")
+    for index in range(10):
+        print(f"Datum {index} shape {dset[index].shape}, datatype {dset[index].dtype}")
+
+    fig, axes = plt.subplots(3, 4, sharex=True, sharey=True)
+    for ax_index, ax_col in enumerate(axes.T):
+        datum = dset[ax_index]
+        ax_col[0].imshow(datum[0], cmap="inferno")
+        ax_col[1].imshow(datum[1], cmap="inferno")
+        ax_col[2].imshow(datum[2], cmap="inferno")
     plt.show(block=True)
+
+    # # Plot some examples
+    # fig, axes = plt.subplots(2, 4)
+    # for ax in axes.flatten():
+    #     rand_index = int(torch.randint(0, len(dset), (1,))[0])
+    #     frame = dset[rand_index]
+    #     ax.imshow(frame[0], cmap="inferno")
+    #     ax.axis("off")
+    # fig.suptitle("Example images")
+    #
+    # fig, axes = plt.subplots(2, 4)
+    # for ax in axes.flatten():
+    #     rand_index = int(torch.randint(0, len(dset), (1,))[0])
+    #     frame = dset[rand_index]
+    #     ax.hist(frame[0].flatten(), bins=64)
+    # fig.suptitle("Example histograms")
+    #
+    # vid_frame = dset.load_interpolate(dset.sample_filegroups[0])[0]
+    # fig, axes = plt.subplots(2, 2)
+    # axes[0, 0].imshow(vid_frame[0], cmap="inferno")
+    # axes[0, 1].hist(vid_frame[0, 0].flatten(), bins=64)
+    # axes[1, 0].imshow(dset[0][0], cmap="inferno")
+    # axes[1, 1].hist(dset[0][0].flatten(), bins=64)
+    # fig.suptitle("Example pre and post normalisation histograms")
+    #
+    # plt.show(block=True)

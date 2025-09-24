@@ -47,6 +47,9 @@ class EncoderBlock(nn.Module):
         super(EncoderBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding="same")
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding="same")
+        self.bn1 = nn.GroupNorm(2, out_ch)
+        self.bn2 = nn.GroupNorm(2, out_ch)
+        # self.dropout = nn.Dropout2d(p=0.2)
         self.activation = nn.LeakyReLU()
         # self.pool: Union[nn.Module, None] = nn.AvgPool2d(2) if pool else None
         self.pool: nn.Module | None = AvgBlurPool() if pool else None
@@ -55,9 +58,12 @@ class EncoderBlock(nn.Module):
         if self.pool:
             x = self.pool(x)
         x = self.conv1(x)
+        x = self.bn1(x)
         x = self.activation(x)
         x = self.conv2(x)
+        x = self.bn2(x)
         x = self.activation(x)
+        # x = self.dropout(x)
         return x
 
 
@@ -68,6 +74,9 @@ class DilatedEncoderBlock(nn.Module):
         super(DilatedEncoderBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding='same', dilation=1)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding='same')
+        self.bn1 = nn.GroupNorm(2, out_ch)
+        self.bn2 = nn.GroupNorm(2, out_ch)
+        # self.dropout = nn.Dropout2d(p=0.2)
         self.activation = nn.LeakyReLU()
         # self.pool: Union[nn.Module, None] = nn.AvgPool2d(2) if pool else None
         self.pool: nn.Module | None = AvgBlurPool() if pool else None
@@ -76,9 +85,12 @@ class DilatedEncoderBlock(nn.Module):
         if self.pool:
             x = self.pool(x)
         x = self.conv1(x)
+        x = self.bn1(x)
         x = self.activation(x)
         x = self.conv2(x)
+        x = self.bn2(x)
         x = self.activation(x)
+        # x = self.dropout(x)
         return x
 
 
@@ -94,15 +106,21 @@ class DecoderBlock(nn.Module):
             in_ch + in_ch // 2, out_ch, kernel_size=kernel_size, padding="same"
         )  # Skip has fewer chans
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding="same")
+        self.bn1 = nn.GroupNorm(2, out_ch)
+        self.bn2 = nn.GroupNorm(2, out_ch)
+        # self.dropout = nn.Dropout2d(p=0.2)
         self.activation = nn.LeakyReLU()
 
     def forward(self, x: torch.Tensor, skip_features: torch.Tensor):
         x = self.upsample(x)
         x = torch.cat((skip_features, x), dim=1)
         x = self.conv1(x)
+        x = self.bn1(x)
         x = self.activation(x)
         x = self.conv2(x)
+        x = self.bn2(x)
         x = self.activation(x)
+        # x = self.dropout(x)
         return x
 
 

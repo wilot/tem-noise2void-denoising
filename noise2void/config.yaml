@@ -2,33 +2,36 @@
 
 # These are used in various places
 run_directory: "runs/IrGLC/run_{index}"  # {index} is replaced with the next integer if necessary
-image_size: 512
+image_size: 256
 channels: ["HAADF",]
 
 model:  # Used to define the model
   name: "UNet"
-  depth: 4
-  first_layer_channels: 64
+  depth: 5
+  first_layer_channels: 32
   initial_kernel_size: 5
   state_savename: "model_state.pt"    # Where to save the raw weights
   traced_savename: "traced_model.pt"  # Where to save the JIT/traced ScriptModule
 
 trainer:
-  learning_rate: 2e-5  # Adam optimiser learning rate
-  batch_size: 7
-  epochs: 32
-  spacing: 24
+  learning_rate: 1e-5  # Adam optimiser learning rate
+  batch_size: 32
+  epochs: 128
+  spacing: 32
   test_fraction: 0.2
 
 dataset:
   type: "IridiumGLCVideo"
-  px_scale: 0.007   # Size of pixels in nanometres
-  example_index: 5  # The index to reserve for validation
+  px_scale: 0.007     # Interpolation target pixel size, in nanometres
+  video_filter: ["HAADF Image_movie_0231a_817.dm4", "HAADF Image_movie_180a_1224.dm4", "HAADF Image_movie_0235a_487.dm4", "HAADF Image_movie_0236a_600.dm4"]
+#  video_filter: none
+#  example_index: 800  # The index to reserve for validation. These are good examples for 512px dset
+  example_index: 2600
 
-  predicter:
-    video_fps: 10
-    device: "cuda"  # A valid PyTorch device string
-    batch_size: 4
+predicter:
+  video_fps: 10
+  device: "cpu"  # A valid PyTorch device string
+  batch_size: 8
 
 # Logging config
 defaults:
