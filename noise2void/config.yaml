@@ -30,8 +30,8 @@ dataset:
 
 predicter:
   video_fps: 10
-  device: "cpu"  # A valid PyTorch device string
-  batch_size: 8
+  device: "cuda:0"  # A valid PyTorch device string
+  batch_size: 48
 
 # Logging config
 defaults:

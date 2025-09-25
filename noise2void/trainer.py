@@ -302,8 +302,8 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
         params.test_dataset, params.batch_size, sampler=test_sampler,
     )
 
-    # criterion = MSELoss()
-    criterion = L1Loss()
+    criterion = MSELoss()
+    # criterion = L1Loss()
     optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
     validation_image = params.validation_image.to(device)
 

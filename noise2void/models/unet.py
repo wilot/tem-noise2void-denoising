@@ -47,8 +47,8 @@ class EncoderBlock(nn.Module):
         super(EncoderBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding="same")
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding="same")
-        self.bn1 = nn.GroupNorm(2, out_ch)
-        self.bn2 = nn.GroupNorm(2, out_ch)
+        self.bn1 = nn.GroupNorm(8, out_ch)
+        self.bn2 = nn.GroupNorm(8, out_ch)
         # self.dropout = nn.Dropout2d(p=0.2)
         self.activation = nn.LeakyReLU()
         # self.pool: Union[nn.Module, None] = nn.AvgPool2d(2) if pool else None
@@ -74,8 +74,8 @@ class DilatedEncoderBlock(nn.Module):
         super(DilatedEncoderBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding='same', dilation=1)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding='same')
-        self.bn1 = nn.GroupNorm(2, out_ch)
-        self.bn2 = nn.GroupNorm(2, out_ch)
+        self.bn1 = nn.GroupNorm(8, out_ch)
+        self.bn2 = nn.GroupNorm(8, out_ch)
         # self.dropout = nn.Dropout2d(p=0.2)
         self.activation = nn.LeakyReLU()
         # self.pool: Union[nn.Module, None] = nn.AvgPool2d(2) if pool else None
@@ -106,8 +106,8 @@ class DecoderBlock(nn.Module):
             in_ch + in_ch // 2, out_ch, kernel_size=kernel_size, padding="same"
         )  # Skip has fewer chans
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding="same")
-        self.bn1 = nn.GroupNorm(2, out_ch)
-        self.bn2 = nn.GroupNorm(2, out_ch)
+        self.bn1 = nn.GroupNorm(8, out_ch)
+        self.bn2 = nn.GroupNorm(8, out_ch)
         # self.dropout = nn.Dropout2d(p=0.2)
         self.activation = nn.LeakyReLU()
 

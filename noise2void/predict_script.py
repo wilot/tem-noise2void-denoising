@@ -85,7 +85,8 @@ def save_plot_video(meta: MultiChannelMetadata, video: np.ndarray, noisy_video: 
     vid_savepath = savepath.with_suffix(".mp4")
     hist_savepath = savepath.parent / (savepath.stem + " HISTOGRAM.png")
 
-    vmin, vmax = np.min(noisy_video, axis=(0, 2, 3)), np.max(noisy_video, axis=(0, 2, 3))
+    noisy_vmin, noisy_vmax = np.min(noisy_video, axis=(0, 2, 3)), np.max(noisy_video, axis=(0, 2, 3))
+    denoised_vmin, denoised_vmax = np.min(video, axis=(0, 2, 3)), np.max(video, axis=(0, 2, 3))
 
     gridspec_kw = dict(bottom=0, top=1, left=0, right=1, wspace=0, hspace=0)
     if video.shape[1] > 3:
@@ -102,14 +103,18 @@ def save_plot_video(meta: MultiChannelMetadata, video: np.ndarray, noisy_video: 
     if meta.px_scale is not None:
         sbar = ScaleBar(meta.px_scale, "nm", location="lower right", color='w', box_color='k', box_alpha=0.7)
         axes[-1, -1].add_artist(sbar)
-    writer = ani.FFMpegWriter(fps=fps)
+    writer = ani.FFMpegWriter(fps=fps, codec="h264_nvenc", extra_args=["-cq:v", "19"])  # Use Nvidia GPU encoder
     with writer.saving(fig, vid_savepath, dpi=210):
         noisy_chan_ims = [  # Initialise the plot
-            axes[0, chan_index].imshow(noisy_video[0, chan_index], cmap="inferno", vmin=vmin[chan_index], vmax=vmax[chan_index])
+            axes[0, chan_index].imshow(
+                noisy_video[0, chan_index], cmap="inferno", vmin=noisy_vmin[chan_index], vmax=noisy_vmax[chan_index]
+            )
             for chan_index in range(video.shape[1])
         ]
         denoised_chan_ims = [
-            axes[1, chan_index].imshow(video[0, chan_index], cmap="inferno", vmin=vmin[chan_index], vmax=vmax[chan_index])
+            axes[1, chan_index].imshow(
+                video[0, chan_index], cmap="inferno", vmin=denoised_vmin[chan_index], vmax=denoised_vmax[chan_index]
+            )
             for chan_index in range(video.shape[1])
         ]
         writer.grab_frame()
@@ -164,7 +169,7 @@ def main():
 
     # Initialise model and dataset from config
     config = omegaconf.OmegaConf.load(config_file)
-    dataset: MultiChannelDataset = dataset_generators[config.dataset.type](config, predict=False)
+    dataset: MultiChannelDataset = dataset_generators[config.dataset.type](config, predict=True)
     print("Dataset and model loaded")
 
     # Load model weights
@@ -187,17 +192,17 @@ def main():
     for meta in tqdm.tqdm(dataset.sample_filegroups, desc="Denoising and plotting"):
 
         datum = dataset.load_interpolate(meta)
-        # datum = dataset.normalise(datum.to(device)).to(CPU)  # Normalise on device, for speed...
+        datum = dataset.normalise(datum)
 
         with torch.no_grad():
             if datum.shape[0] > max_batch_size:  # Process in batches
                 process_buf = torch.split(datum, max_batch_size, dim=0)
-                pred = torch.cat([  # Normalise and predict on the device
-                    model(datum.normalise(batch.to(device))).to(CPU)
+                pred = torch.cat([  # Predict on the device
+                    model(batch.to(device)).to(CPU)
                     for batch in process_buf
                 ], dim=0)
             else:
-                pred = model(dataset.normalise(datum.to(device))).to(CPU)
+                pred = model(datum.to(device)).to(CPU)
             pred = pred.detach()
             pred = dataset.uninterpolate(meta, pred).numpy()  # Return to original scale
 
