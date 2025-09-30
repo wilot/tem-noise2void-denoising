@@ -40,7 +40,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
 
     def __init__(
         self, image_size: int, channels: list[Channel], px_scale: float, example_index: int | None = None,
-            crop_bounds: int=4
+            crop_bounds: int=5
     ):
         """
         Parameters
@@ -116,6 +116,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
         interp_shape = int(interp_factor * meta.shape)
         if interp_shape % 2**self.crop_bounds != 0:  # Round this shape to the nearest order of two
             interp_shape += 2**self.crop_bounds - interp_shape % 2**self.crop_bounds
+        print(f"load_interpolate interpolating to {interp_shape} for {meta.fpaths[Channel.HAADF]}")
         datum = tforms.functional.resize(datum, interp_shape)  # Interpolate to correct scale
         return datum
 
@@ -200,7 +201,7 @@ class TungstenDataset(Dataset, MultiChannelDataset):
     def __getitem__(self, index: int) -> torch.Tensor:
         """Loads, interpolates and randomly crops from the specified multi-channel image"""
 
-        datum = self._load_interpolate_random_crop(self.sample_filegroups[index])
+        datum = self._load_interpolate_random_crop(self.sample_filegroups[index])[0]
         datum = self.normalise(datum)
         return datum
 
@@ -395,8 +396,8 @@ class TungstenDataset(Dataset, MultiChannelDataset):
 if __name__ == "__main__":
     # For getting info on the samples and plotting etc.
 
-    dset = TungstenDataset(512, [Channel.HAADF, Channel.BF], 0.007)
-    dset._print_dataset_stats()
+    dset = TungstenDataset(256, [Channel.HAADF, Channel.BF], 0.007, None)
+    # dset._print_dataset_stats()
 
     # Plot example images
     fig, axes = plt.subplots(len(dset.channels), 4, sharex=True, sharey=True)

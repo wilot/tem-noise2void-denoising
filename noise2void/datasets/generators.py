@@ -13,7 +13,8 @@ def _generate_tungsten_from_config(config, predict: bool) -> TungstenDataset:
 
     channels = [Channel(chan) for chan in config.channels]
     return TungstenDataset(
-        config.image_size, channels, config.dataset.px_scale, config.dataset.example_index
+        config.image_size, channels, config.dataset.px_scale,
+        config.dataset.example_index if config.dataset.example_index != "none" else None
     )
 
 
