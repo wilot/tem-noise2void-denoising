@@ -19,7 +19,12 @@ def _generate_tungsten_from_config(config, predict: bool) -> TungstenDataset:
 
 
 def _generate_iridium_video_from_config(config, predict: bool) -> IridiumVideoDataset:
-    """Generates an IridiumDataset from config. If predict is set, the video filter is ignored (e.g. for inference)."""
+    """Generates an IridiumDataset from config."""
+
+    # This dataset only has the HAADF channel!
+    channels = [Channel(chan) for chan in config.channels]
+    if len(channels) > 1 or channels[0] != Channel.HAADF:
+        raise ValueError(f"Only HAADF channel is valid for IrVideo dataset, not {channels=}")
 
     try:  # In older config file versions, this was None
         video_filter = config.dataset.video_filter
@@ -28,12 +33,12 @@ def _generate_iridium_video_from_config(config, predict: bool) -> IridiumVideoDa
     if video_filter == "none":
         video_filter = None
     return IridiumVideoDataset(
-        config.image_size, config.dataset.example_index, None if predict else video_filter
+        config.image_size, config.dataset.example_index, video_filter
     )
 
 
 # A mapping from the string specified in every config file's dataset section to a method to generate it from that config
 dataset_generators = {
     "WS2": _generate_tungsten_from_config,
-    "IridiumGLCVideo": _generate_iridium_video_from_config,
+    "IridiumVideo": _generate_iridium_video_from_config,
 }

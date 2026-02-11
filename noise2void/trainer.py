@@ -77,10 +77,10 @@ class Trainer:
     """Trains a model according to the Noise2Void technique."""
 
     def __init__(
-            self, dataset: torch.utils.data.Dataset, model: UNet, distributed: bool, test_image: torch.Tensor,
+            self, dataset: torch.utils.data.Dataset, model: torch.nn.Module, distributed: bool, test_image: torch.Tensor,
             config: TrainConfig
     ) -> None:
-        """Performs training on a UNet model with Noise2Void training.
+        """Performs training on a model with Noise2Void training.
 
         Generates a Noise2Void grid and applies the grid, deletes information in the input at those gridpoints, and
         focuses training attention to those missing regions, according to the Noise2Void technique.
@@ -304,7 +304,7 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
 
     criterion = MSELoss()
     # criterion = L1Loss()
-    optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
+    optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate, weight_decay=5E-6)
     validation_image = params.validation_image.to(device)
 
     for epoch in range(params.epochs):

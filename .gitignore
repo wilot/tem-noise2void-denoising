@@ -1,5 +1,9 @@
 data/
 runs/
 outputs/
+datasets/*
+!datasets/__init__.py
+!datasets/generators.py
+!datasets/channels.py
 .idea/
 __pycache__/

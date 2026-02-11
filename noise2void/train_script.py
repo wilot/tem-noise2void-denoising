@@ -74,6 +74,7 @@ def main(config: DictConfig):
         sys.exit(2)
     model = model_generators[config.model.name](config)
     print("Defined model")
+    # model = torch.compile(model)
 
     if config.dataset.type not in dataset_generators:
         print(f"Dataset not recognized: {config.dataset.type}")

@@ -175,19 +175,19 @@ def main():
     # Load model weights
     model = torch.jit.load(torchscript_file)
 
-    try:  # The predicter config wasn't present in early versions...
-        max_batch_size = config.predicter.batch_size
-        video_fps = config.predicter.video_fps
-        device = torch.device(config.predicter.device)
-    except omegaconf.errors.ConfigAttributeError as err:
-        print("Predicter configuration not found, using defaults.")
-        max_batch_size = MAX_PREDICT_SIZE
-        video_fps = VIDEO_FPS
-        device = torch.device("cpu")
+    # try:  # The predicter config wasn't present in early versions...
+    #     max_batch_size = config.predicter.batch_size
+    #     video_fps = config.predicter.video_fps
+    #     device = torch.device(config.predicter.device)
+    # except omegaconf.errors.ConfigAttributeError as err:
+    print("Predicter configuration not found, using defaults.")
+    max_batch_size = MAX_PREDICT_SIZE
+    video_fps = VIDEO_FPS
+    device = torch.device("cpu")
     print(f"Using a batch size of {max_batch_size} on {device}")
 
-    model.to(device)
-    print("Model loaded onto device")
+    model = model.to(device)
+    print(f"Model loaded onto device {device}")
 
     for meta in tqdm.tqdm(dataset.sample_filegroups, desc="Denoising and plotting"):
 
