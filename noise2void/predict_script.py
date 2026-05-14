@@ -9,6 +9,7 @@ dataset.
 
 import sys
 import argparse
+import subprocess
 from pathlib import Path
 
 import torch
@@ -66,8 +67,10 @@ def save_plot_image(meta: MultiChannelMetadata, image: np.ndarray, noisy_image: 
         )
         axes = axes.T  # This trick means the rest of the code works without changing anything
     for chan_index in range(image.shape[1]):
-        axes[0, chan_index].imshow(noisy_image[0, chan_index], cmap="inferno", vmin=vmin[chan_index], vmax=vmax[chan_index])
-        axes[1, chan_index].imshow(image[0, chan_index, ...], cmap="inferno", vmin=vmin[chan_index], vmax=vmax[chan_index])
+        axes[0, chan_index].imshow(noisy_image[0, chan_index], cmap="inferno",
+                                   vmin=vmin[chan_index], vmax=vmax[chan_index])
+        axes[1, chan_index].imshow(image[0, chan_index, ...], cmap="inferno",
+                                   vmin=vmin[chan_index], vmax=vmax[chan_index])
         axes[0, chan_index].axis('off')
         axes[1, chan_index].axis("off")
     if meta.px_scale is not None:
@@ -75,6 +78,91 @@ def save_plot_image(meta: MultiChannelMetadata, image: np.ndarray, noisy_image: 
         axes[-1, -1].add_artist(sbar)
     fig.savefig(plot_savepath, dpi=210)
     plt.close(fig)
+
+
+def _normalize_to_u8(x: np.ndarray, vmin: np.ndarray, vmax: np.ndarray) -> np.ndarray:
+    """Normalises a multi-channel video and converts to uint8 format. Videos must have a channel axis even if there
+    is only one channel, i.e. (frames, chans, H, W).
+    Parameters
+    ----------
+    x: np.ndarray
+        The video to convert to uint8
+    vmin: np.ndarray
+        The intensity which will map to zero uint8. Must be one value per channel i.e. shape (chans,)
+    vmax: np.ndarray:
+        The intensity which will map to 255 uint8. Must be one value per channel i.e. shape (chans,)
+    """
+    assert len(x.shape) == 3, "Array must have a channel axis (chans, H, W)"
+    assert len(vmin.shape) == 1 and len(vmax.shape) == 1
+    assert vmin.shape[0] == vmax.shape[0] == x.shape[1], f"Params have mismatched shapes: {
+        x.shape=}, {vmin.shape=}, {vmax.shape=}"
+
+    vmin = vmin.reshape(1, len(vmin), 1, 1)
+    vmax = vmax.reshape(1, len(vmax), 1, 1)
+    x = np.clip((x - vmin) / (vmax - vmin + 1e-8), 0.0, 1.0)
+    return (x * 255.0).astype(np.uint8)
+
+
+def _apply_cmap_u8(gray_u8: np.ndarray, cmap_name: str = "inferno") -> np.ndarray:
+    """Applies a colour map to a uint8 array, converting it to RGB. The input should be shaped (..., H, W) and be
+    bound between [0, 1].
+    """
+    # gray_u8: (H, W) uint8
+    cmap = plt.get_cmap(cmap_name)
+    rgba = cmap(gray_u8.astype(np.float32) / 255.0)  # float [0,1], RGBA
+    rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+    return rgb
+
+
+def save_video_fast(meta: MultiChannelMetadata, video: np.ndarray, noisy_video: np.ndarray, fps: int, savepath: Path):
+    """Saves a video without using matplotlib"""
+
+    assert len(video.shape) == 4 and len(noisy_video.shape) == 4
+
+    frames, chans, H, W = video.shape
+    assert noisy_video.shape == (frames, chans, H, W)
+
+    cmap = plt.get_cmap("inferno")
+
+    vmin, vmax = np.percentile(noisy_video, (0.1, 99.9), axis=(0, 2, 3), keepdims=True)
+    out_w = W * chans  # Column for each channel
+    out_h = H * 2  # Noisy and noise-free rows
+
+    # Normalise [0, 1] and convert to RGB with colourmap
+    vid_norm = np.clip((video - vmin) / (vmax - vmin + 1E-8), 0, 1)  # Scale to [0, 1] & clip at 0.1%
+    noisy_vid_norm = np.clip((noisy_video - vmin) / (vmax - vmin + 1E-8), 0, 1)
+    vid_norm = cmap(vid_norm)  # Convert to RGBA i.e. shape (frames, chans, H, W, 4)
+    noisy_vid_norm = cmap(noisy_vid_norm)
+    vid_norm = (vid_norm[..., :3] * 255.).astype(np.uint8)  # Convert RGBA -> RGB & uint8 for ffmpeg
+    noisy_vid_norm = (noisy_vid_norm[..., :3] * 255.).astype(np.uint8)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{out_w}x{out_h}",
+        "-r", str(fps),
+        "-i", "-",
+        "-an",
+        "-vcodec", "libx264",
+        "-preset", "fast",
+        "-crf", "19",
+        "-pix_fmt", "yuv420p",
+        str(savepath),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    full_frame = np.zeros((out_h, out_w, 3), dtype=np.uint8)  # shape (2H, chans * W, RGB)
+    try:
+        for frame in range(frames):
+            for chan in range(chans):
+                full_frame[:H, chan*W:(chan+1)*W] = noisy_vid_norm[frame, chan]
+                full_frame[H:, chan*W:(chan+1)*W] = vid_norm[frame, chan]
+            proc.stdin.write(frame.to_bytes())
+    finally:
+        proc.stdin.close()
+        proc.wait()
 
 
 def save_plot_video(meta: MultiChannelMetadata, video: np.ndarray, noisy_video: np.ndarray, fps: int, savepath: Path):
@@ -152,7 +240,7 @@ def main():
     parser = argparse.ArgumentParser(
         prog="Noise2Void prediction script",
         description="Denoises a dataset with a trained Noise2Void model. Uses config from the training run unless " +
-            "optionally overridden",
+        "optionally overridden",
     )
     parser.add_argument("run_path", type=Path, help="Path to the run folder")
     parser.add_argument("save_path", type=Path, help="Path to the output folder")
@@ -182,7 +270,6 @@ def main():
     # except omegaconf.errors.ConfigAttributeError as err:
     print("Predicter configuration not found, using defaults.")
     max_batch_size = MAX_PREDICT_SIZE
-    video_fps = VIDEO_FPS
     device = torch.device("cpu")
     print(f"Using a batch size of {max_batch_size} on {device}")
 
@@ -211,7 +298,8 @@ def main():
         if meta.frames is None:  # A single image
             save_plot_image(meta, pred, datum.numpy(), savepath)
         else:
-            save_plot_video(meta, pred, datum.numpy(), video_fps, savepath)
+            # save_plot_video(meta, pred, datum.numpy(), video_fps, savepath)
+            save_video_fast(meta, datum.numpy(), pred, VIDEO_FPS, savepath)
         save_hspy(meta, pred, dataset.channels, savepath)
 
     print("\nComplete.")
