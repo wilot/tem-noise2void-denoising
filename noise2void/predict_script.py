@@ -80,40 +80,6 @@ def save_plot_image(meta: MultiChannelMetadata, image: np.ndarray, noisy_image: 
     plt.close(fig)
 
 
-def _normalize_to_u8(x: np.ndarray, vmin: np.ndarray, vmax: np.ndarray) -> np.ndarray:
-    """Normalises a multi-channel video and converts to uint8 format. Videos must have a channel axis even if there
-    is only one channel, i.e. (frames, chans, H, W).
-    Parameters
-    ----------
-    x: np.ndarray
-        The video to convert to uint8
-    vmin: np.ndarray
-        The intensity which will map to zero uint8. Must be one value per channel i.e. shape (chans,)
-    vmax: np.ndarray:
-        The intensity which will map to 255 uint8. Must be one value per channel i.e. shape (chans,)
-    """
-    assert len(x.shape) == 3, "Array must have a channel axis (chans, H, W)"
-    assert len(vmin.shape) == 1 and len(vmax.shape) == 1
-    assert vmin.shape[0] == vmax.shape[0] == x.shape[1], f"Params have mismatched shapes: {
-        x.shape=}, {vmin.shape=}, {vmax.shape=}"
-
-    vmin = vmin.reshape(1, len(vmin), 1, 1)
-    vmax = vmax.reshape(1, len(vmax), 1, 1)
-    x = np.clip((x - vmin) / (vmax - vmin + 1e-8), 0.0, 1.0)
-    return (x * 255.0).astype(np.uint8)
-
-
-def _apply_cmap_u8(gray_u8: np.ndarray, cmap_name: str = "inferno") -> np.ndarray:
-    """Applies a colour map to a uint8 array, converting it to RGB. The input should be shaped (..., H, W) and be
-    bound between [0, 1].
-    """
-    # gray_u8: (H, W) uint8
-    cmap = plt.get_cmap(cmap_name)
-    rgba = cmap(gray_u8.astype(np.float32) / 255.0)  # float [0,1], RGBA
-    rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
-    return rgb
-
-
 def save_video_fast(meta: MultiChannelMetadata, video: np.ndarray, noisy_video: np.ndarray, fps: int, savepath: Path):
     """Saves a video without using matplotlib"""
 
