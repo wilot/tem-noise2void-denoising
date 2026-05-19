@@ -1,9 +1,9 @@
 # Noise2Void training run parameters
 
 # These are used in various places
-run_directory: "runs/IrGLC/run_{index}"
+run_directory: "runs/AuAcetone/run_{index}"
 image_size: 512
-channels: ["HAADF"]
+channels: ["HAADF", "BF"]
 
 model:  # Used to define the model
   name: "UNet"
@@ -21,10 +21,10 @@ trainer:
   test_fraction: 0.25
 
 dataset:
-  type: "IridiumGLCVideo"
-  px_scale: 0.007     # Interpolation target pixel size, in nanometres
-  video_filter: ["HAADF Image_movie_0231a_817.dm4", "HAADF Image_movie_180a_1224.dm4", "HAADF Image_movie_0235a_487.dm4", "HAADF Image_movie_0236a_600.dm4"]
-#  video_filter: none
+  type: "AuAcetoneDataset"
+  px_scale: 0.026     # Interpolation target pixel size, in nanometres
+  # video_filter: ["HAADF Image_movie_0231a_817.dm4", "HAADF Image_movie_180a_1224.dm4", "HAADF Image_movie_0235a_487.dm4", "HAADF Image_movie_0236a_600.dm4"]
+  video_filter: none
 #  example_index: none
   example_index: 800  # The index to reserve for validation. These are good examples for 512px dset
 #  example_index: 2600

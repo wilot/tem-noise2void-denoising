@@ -59,9 +59,9 @@ class MultiChannelMetadata:
         elif px_units == "µm":
             px_scale *= float(1E3)
             px_units = "nm"
-        assert px_units == "nm", f"Unexpected units: {px_units}"
         assert sig.data.shape[-2] == sig.data.shape[-1]
-        self.px_scale = px_scale
+        if px_units == "nm":
+            self.px_scale = px_scale
         self.shape = sig.data.shape[-1]
 
     def has_channels(self, channels: set[Channel]) -> bool:

@@ -8,6 +8,7 @@ import sys
 import shutil
 from pathlib import Path
 
+import numpy as np
 import torch
 import hydra
 from omegaconf import DictConfig
@@ -59,6 +60,8 @@ def save_trace_model(model: UNet, example_datum: torch.Tensor, savedir: Path, mo
     torch.save(model.state_dict(), savedir / model_config.state_savename)
     model.eval()
     model = model.to(torch.device("cpu"))
+    if isinstance(example_datum, np.ndarray):
+        example_datum = torch.from_numpy(example_datum)
     traced_model: torch.jit.ScriptModule = torch.jit.trace(model, example_datum)
     traced_model.save(savedir / model_config.traced_savename)
 

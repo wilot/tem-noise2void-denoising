@@ -305,7 +305,7 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
     criterion = MSELoss()
     # criterion = L1Loss()
     optimiser = torch.optim.Adam(model.parameters(), lr=params.learning_rate, weight_decay=5E-6)
-    validation_image = params.validation_image.to(device)
+    validation_image = torch.from_numpy(params.validation_image).to(device)
 
     for epoch in range(params.epochs):
         model.train()
@@ -322,7 +322,7 @@ def _train_distributed_model(rank: int, params: _TrainingProcessConfig):
             # Selectively mask a copy of the image, on the CPU
             x = void_image_batch(image_batch.clone().numpy(), mask_grid, params.void_size)
             x = torch.from_numpy(x).to(device)  # Transfer to GPU
-            y = image_batch[:, 0][:, None, ...].to(device)  # Transfer the original to the GPU too (as the target)
+            y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
 
             prediction = model(x)
             loss = criterion(prediction, y, mask_grid_device) / len(image_batch)
@@ -402,7 +402,7 @@ def _train_model(params: _TrainingProcessConfig):
     device = torch.device("cuda")
 
     # Constant device arrays
-    validation_image = params.validation_image.to(device)
+    validation_image = torch.from_numpy(params.validation_image).to(device)
 
     criterion = MSELoss()
     # criterion = L1Loss()
@@ -427,7 +427,7 @@ def _train_model(params: _TrainingProcessConfig):
             # Selectively mask a copy of the image, on the CPU
             x = void_image_batch(image_batch.clone().numpy(), mask_grid, params.void_size)
             x = torch.from_numpy(x).to(device)  # Transfer to GPU
-            y = image_batch[:, 0][:, None, ...].to(device)  # Transfer the original to the GPU too (as the target)
+            y = image_batch.to(device)  # Transfer the original to the GPU too (as the target)
 
             prediction = params.model(x)
             loss = criterion(prediction, y, mask_grid_device) / len(image_batch)  # Norm over non-uniform batch length

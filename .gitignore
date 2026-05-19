@@ -1,6 +1,7 @@
 data/
 runs/
 outputs/
+OLD/
 datasets/*
 !datasets/__init__.py
 !datasets/generators.py

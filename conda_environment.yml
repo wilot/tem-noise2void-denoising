@@ -1,7 +1,9 @@
 name: Noise2Void
 channels:
+  - conda-forge
   - defaults
 dependencies:
+  - python=3.11
   - torchvision
   - hyperspy
   - tensorboard
